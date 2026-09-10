@@ -1,0 +1,22 @@
+[package]
+name = "lightarray"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.29"
+
+[features]
+# Enabled by maturin (see pyproject.toml) when building the extension; left
+# off for `cargo test`, which must link against libpython.
+default = []
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

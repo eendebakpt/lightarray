@@ -1,0 +1,178 @@
+"""Drop-in check against a real downstream library: lmfit's documentation
+examples run with `import lightarray as np` and reach the same optimum as
+with NumPy."""
+
+import lightarray
+import numpy
+import pytest
+from lightarray import _fallback
+
+lmfit = pytest.importorskip("lmfit")
+
+
+def model_fit(np, seed=7):
+    """lmfit 'Fitting with Model' example (doc_model_gaussian.py)."""
+    from lmfit import Model
+
+    def gaussian(x, amp, cen, wid):
+        return (amp / (np.sqrt(2 * np.pi) * wid)) * np.exp(-((x - cen) ** 2) / (2 * wid**2))
+
+    x = np.linspace(-10, 10, 101)
+    noise = numpy.random.default_rng(seed).normal(scale=0.1, size=101)
+    y = gaussian(x, 2.33, 0.21, 1.51) + np.asarray(noise)
+    result = Model(gaussian).fit(y, x=x, amp=5, cen=5, wid=1)
+    return result
+
+
+def minimize_example(np, seed=3):
+    """lmfit 'Getting started' example: minimize() with a residual function."""
+    from lmfit import Parameters, minimize
+
+    def residual(params, x, data):
+        amp = params["amp"]
+        phase = params["phase"]
+        freq = params["frequency"]
+        decay = params["decay"]
+        model = amp * np.sin(x * freq + phase) * np.exp(-x * x * decay)
+        return model - data
+
+    x = np.linspace(0, 15, 301)
+    noise = numpy.random.default_rng(seed).normal(size=301, scale=0.2)
+    data = 5.0 * np.sin(2 * x - 0.1) * np.exp(-x * x * 0.025) + np.asarray(noise)
+    params = Parameters()
+    params.add("amp", value=10)
+    params.add("decay", value=0.1)
+    params.add("phase", value=0.2)
+    params.add("frequency", value=3.0)
+    return minimize(residual, params, args=(x, data))
+
+
+@pytest.mark.parametrize("example", [model_fit, minimize_example])
+def test_lmfit_example_runs_on_lightarray_and_matches_numpy(example):
+    expected = example(numpy)
+    before = _fallback.calls
+    got = example(lightarray)
+    delegated = _fallback.calls - before
+    assert got.success
+    for name in expected.params:
+        numpy.testing.assert_allclose(got.params[name].value, expected.params[name].value, rtol=1e-6, atol=1e-8)
+    numpy.testing.assert_allclose(got.chisqr, expected.chisqr, rtol=1e-6)
+    if hasattr(expected, "best_fit"):  # lmfit stores its own NumPy copy of the evaluated model
+        numpy.testing.assert_allclose(numpy.asarray(got.best_fit), expected.best_fit, rtol=1e-6)
+    print(f"{example.__name__}: {delegated} delegated calls over {got.nfev} function evaluations")
+
+
+@pytest.mark.parametrize("example", [model_fit, minimize_example])
+def test_lmfit_internals_rebound_to_lightarray(example):
+    """`lightarray.patch_module(lmfit)` rebinds lmfit's own NumPy references
+    (its `np` aliases, ufuncs and `from numpy import ...` names) to
+    lightarray, so lmfit's internal array work runs on lightarray as well.
+    SciPy underneath keeps NumPy, so every array crossing into the
+    optimiser is still converted (zero-copy) at that boundary."""
+    expected = example(numpy)
+    rebound = lightarray.patch_module(lmfit)
+    try:
+        assert rebound > 0
+        before = _fallback.calls
+        got = example(lightarray)
+        delegated = _fallback.calls - before
+    finally:
+        assert lightarray.unpatch_module(lmfit) == rebound
+    assert got.success
+    for name in expected.params:
+        numpy.testing.assert_allclose(got.params[name].value, expected.params[name].value, rtol=1e-6, atol=1e-8)
+    numpy.testing.assert_allclose(got.chisqr, expected.chisqr, rtol=1e-6)
+    print(f"{example.__name__} with lmfit patched: {delegated} delegated calls over {got.nfev} function evaluations")
+
+
+def test_patch_toggle_and_context_manager():
+    assert not lightarray.is_patched(lmfit)
+    assert lightarray.set_patched(lmfit, True) is True
+    assert lightarray.set_patched(lmfit, True) is True  # idempotent
+    assert lmfit.minimizer.np is lightarray
+    assert lightarray.set_patched(lmfit, False) is False
+    assert lmfit.minimizer.np is numpy
+    with lightarray.patched(lmfit):
+        assert lightarray.is_patched(lmfit) and lmfit.model.np is lightarray
+        result = minimize_example(lightarray)
+        assert result.success
+    assert not lightarray.is_patched(lmfit) and lmfit.model.np is numpy
+
+
+def test_environment_toggle_patches_on_import(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    code = "import lightarray, lmfit, numpy\nprint(lightarray.is_patched(lmfit), lmfit.minimizer.np is lightarray)\n"
+    env = {**os.environ, "LIGHTARRAY_PATCH": "lmfit"}
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "True True"
+    env["LIGHTARRAY_PATCH"] = ""
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False False"
+    code2 = "import scipy.optimize, lightarray\nprint(lightarray.is_patched(scipy), repr(scipy.optimize._minpack_py.np))\n"
+    env["LIGHTARRAY_PATCH"] = "scipy:numpy"
+    out = subprocess.run([sys.executable, "-c", code2], env=env, capture_output=True, text=True, check=True).stdout
+    assert out.startswith("True <lightarray (type-preserving")
+
+
+def test_patched_lmfit_still_works_for_numpy_scripts():
+    """A script that keeps using NumPy arrays must work while lmfit is patched:
+    lmfit's Parameter.__array__ now calls lightarray's array(), and NumPy
+    insists that __array__ returns a real ndarray."""
+    with lightarray.patched(lmfit):
+        p = lmfit.Parameters()
+        p.add("f", value=2.0)
+        out = numpy.ones(3) * p["f"]
+        assert isinstance(out, numpy.ndarray) and out.tolist() == [2.0, 2.0, 2.0]
+        assert isinstance(p["f"].__array__(), numpy.ndarray)
+        result = minimize_example(numpy)
+        assert result.success
+        result = minimize_example(lightarray)
+        assert result.success
+
+
+def test_scipy_python_layer_rebound_to_lightarray():
+    """Going further: rebinding every loaded SciPy Python module too (its
+    compiled kernels keep NumPy). Both lmfit examples still converge, for a
+    NumPy-based and a lightarray-based script."""
+    import scipy
+    import scipy.optimize
+
+    expected = {ex.__name__: ex(numpy) for ex in (model_fit, minimize_example)}
+    rebound_lmfit = lightarray.patch_module(lmfit)
+    rebound_scipy = lightarray.patch_module(scipy)
+    try:
+        assert rebound_scipy > 100
+        for ex in (model_fit, minimize_example):
+            for lib in (numpy, lightarray):
+                got = ex(lib)
+                assert got.success
+                for name in expected[ex.__name__].params:
+                    numpy.testing.assert_allclose(got.params[name].value, expected[ex.__name__].params[name].value, rtol=1e-6, atol=1e-8)
+    finally:
+        assert lightarray.unpatch_module(scipy) == rebound_scipy
+        assert lightarray.unpatch_module(lmfit) == rebound_lmfit
+
+
+def test_dunder_array_implementations_return_numpy_while_patched():
+    import types
+
+    mod = types.ModuleType("fake_pkg")
+    mod.np = numpy
+    exec(
+        "class A:\n"
+        "    def __array__(self, dtype=None, copy=None): return np.arange(3.0)\n"
+        "class B:\n"
+        "    def __array__(self, dtype=None, copy=None): return np.array([1.0, 2.0])\n"
+        "class C:\n"
+        "    def __array__(self, dtype=None, copy=None): return np.sin(np.zeros(2))\n",
+        mod.__dict__,
+    )
+    with lightarray.patched(mod):
+        assert mod.np is lightarray
+        for cls in (mod.A, mod.B, mod.C):
+            assert isinstance(cls().__array__(), numpy.ndarray), cls.__name__
+            numpy.testing.assert_array_equal(numpy.asarray(cls()), cls().__array__())
+    assert isinstance(mod.A().__array__(), numpy.ndarray)

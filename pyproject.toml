@@ -1,0 +1,74 @@
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "lightarray"
+description = "Fast small-array library with the NumPy interface: float64 arrays in Rust, everything else delegated to NumPy"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Pieter Eendebak" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.1"]
+keywords = ["numpy", "array", "rust", "performance", "array-api"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/eendebakpt/lightarray"
+Repository = "https://github.com/eendebakpt/lightarray"
+Issues = "https://github.com/eendebakpt/lightarray/issues"
+
+[project.optional-dependencies]
+test = ["pytest", "scipy", "lmfit"]
+examples = ["matplotlib", "lmfit"]
+dev = ["pytest", "scipy", "lmfit", "matplotlib", "ruff", "maturin>=1.13,<2.0"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "lightarray._core"
+features = ["extension-module"]
+exclude = ["python/**/__pycache__/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+extend-exclude = ["benchmarks/carray_reference"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "E731", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"python/lightarray/__init__.py" = ["F401", "F403", "F405", "F821"]
+"tests/*" = ["B011", "B018", "F841"]
+"la.py" = ["E402"]
+"examples/*" = ["E402"]
+
+# ---- wheels: cibuildwheel drives maturin through the PEP 517 backend ----------
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = ["*-musllinux_i686", "*-manylinux_i686", "*-win32", "pp*"]
+build-verbosity = 1
+test-requires = ["pytest", "numpy>=2.1"]
+test-command = "pytest {project}/tests/test_numpy_parity.py {project}/tests/test_dropin.py -q"
+# macOS: arm64 natively and x86_64 cross-compiled, both on the arm64 runner
+[tool.cibuildwheel.linux]
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+archs = ["x86_64", "aarch64"]
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

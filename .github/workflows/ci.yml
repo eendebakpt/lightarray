@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff, rustfmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format check
+        run: ruff format --check .
+        continue-on-error: true   # formatting is advisory until the tree has been formatted once
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt check
+        run: cargo fmt --all -- --check
+        continue-on-error: true   # advisory until rustfmt has been run on the tree
+      - name: cargo clippy
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true   # advisory: report, do not block, until the lint set is settled
+
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust unit tests
+        run: cargo test --release --lib
+      - name: Build and install
+        run: |
+          pip install --upgrade pip
+          pip install "numpy>=2.1" pytest scipy lmfit
+          pip install -v .
+      - name: Python tests
+        run: pytest -q
+      - name: Performance gate (informational on shared runners)
+        if: runner.os == 'Linux'
+        run: python benchmarks/gate.py
+        continue-on-error: true
