@@ -84,8 +84,8 @@ per-evaluation path delegates nothing ([examples/lmfit_internals.py](examples/lm
 
 ## Speed
 
-Total time per operation in nanoseconds, best of 7 runs, Python 3.14,
-NumPy 2.5, one core of an i7-13650HX.
+Total time per operation in nanoseconds, best of 7 runs, benchmarked against
+NumPy 2.5.3 on Python 3.14.2, one core of an i7-13650HX.
 
 | Operation | lightarray | NumPy |
 |---|---|---|

@@ -1,6 +1,7 @@
 """Regenerate the Speed table of the README: total time per operation in
 nanoseconds for lightarray and NumPy, best of 7 runs."""
 
+import platform
 import timeit
 
 import lightarray
@@ -52,6 +53,7 @@ def best(stmt, scope, number=200_000, repeat=7):
 if __name__ == "__main__":
     best("a + b", namespace(lightarray))  # warm up: the first measurement runs on a cold core
     best("a + b", namespace(numpy))
+    print(f"NumPy {numpy.__version__}, Python {platform.python_version()}\n")
     print("| Operation | lightarray | NumPy |")
     print("|---|---|---|")
     for stmt in OPERATIONS:
