@@ -12,6 +12,7 @@ OPERATIONS = [
     "np.sin(a)",
     "a.sum()",
     "a.std()",
+    "np.sum(a)",
     "a > 0.5",
     "a[a > 0.5]",
     "(a > 0.2) & (a < 0.8)",
@@ -22,6 +23,7 @@ OPERATIONS = [
     "m[:, 1]",
     "np.array(values)",
     "np.arange(10)",
+    "np.zeros(10)",
     "a[3] = 2.0",
     "a += 1.0",
 ]
@@ -48,6 +50,8 @@ def best(stmt, scope, number=200_000, repeat=7):
 
 
 if __name__ == "__main__":
+    best("a + b", namespace(lightarray))  # warm up: the first measurement runs on a cold core
+    best("a + b", namespace(numpy))
     print("| Operation | lightarray | NumPy |")
     print("|---|---|---|")
     for stmt in OPERATIONS:

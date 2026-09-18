@@ -89,27 +89,34 @@ NumPy 2.5, one core of an i7-13650HX.
 
 | Operation | lightarray | NumPy |
 |---|---|---|
-| `a + b` | 73 | 361 |
-| `a * 2.0` | 73 | 534 |
-| `np.sin(a)` | 116 | 379 |
-| `a.sum()` | 125 | 502 |
-| `a.std()` | 124 | 6546 |
-| `a > 0.5` | 90 | 533 |
-| `a[a > 0.5]` | 231 | 838 |
-| `(a > 0.2) & (a < 0.8)` | 238 | 1421 |
-| `np.where(a > 0.5, a, 0.0)` | 271 | 1382 |
-| `i * 2` | 92 | 636 |
-| `a[idx]` | 105 | 142 |
-| `np.array(values)` | 184 | 477 |
-| `np.arange(10)` | 117 | 401 |
-| `a[3] = 2.0` | 39 | 38 |
-| `a += 1.0` | 26 | 504 |
+| `a + b` | 80 | 345 |
+| `a * 2.0` | 78 | 532 |
+| `np.sin(a)` | 102 | 379 |
+| `a.sum()` | 127 | 502 |
+| `a.std()` | 127 | 6515 |
+| `np.sum(a)` | 170 | 1549 |
+| `a > 0.5` | 93 | 535 |
+| `a[a > 0.5]` | 207 | 843 |
+| `(a > 0.2) & (a < 0.8)` | 267 | 1427 |
+| `np.where(a > 0.5, a, 0.0)` | 297 | 1388 |
+| `i * 2` | 100 | 629 |
+| `a[idx]` | 118 | 146 |
+| `m[1]` | 73 | 77 |
+| `m[:, 1]` | 174 | 85 |
+| `np.array(values)` | 190 | 478 |
+| `np.arange(10)` | 114 | 403 |
+| `np.zeros(10)` | 118 | 176 |
+| `a[3] = 2.0` | 40 | 39 |
+| `a += 1.0` | 28 | 491 |
 
-`a` and `b` are float64 arrays of 10 elements, `i` is `np.arange(10)`,
-`idx` an int64 array of 3 indices and `values` a list of 10 floats.
+`a` and `b` are float64 arrays of 10 elements, `m` is a 10 x 10 float64
+array, `i` is `np.arange(10)`, `idx` an int64 array of 3 indices and `values`
+a list of 10 floats (`python benchmarks/readme_table.py` regenerates the table).
 Reductions include building the `np.float64` result, which is most
-of `a.sum()`'s time. Above roughly 10000 elements the two
-libraries converge; lightarray is not a large-array library.
+of `a.sum()`'s time. Creating a strided view (`m[:, 1]`) is the one
+operation slower than NumPy: it allocates the contiguous cache the kernels
+work on. Above roughly 10000 elements the two libraries converge; lightarray
+is not a large-array library.
 
 ## Status
 
@@ -117,17 +124,23 @@ Version 0.1.0-dev. float64, int64 and bool arrays are native, with NumPy's
 dtype inference (`np.array([1, 2])` is int64, comparisons give bool arrays,
 int and float mix to float64); every other dtype and the long tail of NumPy
 functions go through NumPy at NumPy speed plus about 1 µs and come back as
-NumPy arrays. Known limits: `isinstance(x, numpy.ndarray)` is False for a
-lightarray array and cannot be made True. Indexing with integers and slices,
+NumPy arrays. Known limit: `isinstance(x, numpy.ndarray)` is False for a
+lightarray array and cannot be made True.
+
+Indexing with integers and slices,
 `reshape`, `ravel` and `.T` return views that share memory with the array, as
 in NumPy (`row = a[0]; row[:] = 0` and `a[:, 1] *= 2` change `a`). The
 kernels work on contiguous buffers: a contiguous selection is a window into
 the base's buffer at no extra cost, while a strided one (`a[:, 0]`, `a[::2]`,
 the transpose of a matrix) is gathered from the base when it is used, which
 is cheap for small arrays and one extra pass over the data for large ones.
-Against the official Array API test suite lightarray passes 1360 of
-1374 tests; the remaining ones are complex-number special cases and
-`fft.fftfreq(dtype=)`, which NumPy itself does not pass.
+Views that NumPy returns for delegated operations (`swapaxes`, `split`,
+`a[..., 1]`) stay views as well.
+
+Against the official Array API test suite lightarray passes about 1360 of
+1374 tests (the suite is randomised); the remaining ones are complex-number
+special cases, `finfo` and `fft.fftfreq(dtype=)`, which NumPy itself does
+not pass.
 
 ## Development
 
