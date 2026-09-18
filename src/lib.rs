@@ -403,6 +403,12 @@ unsafe fn elementwise_entry(
             fallback(py, "call", PyTuple::new(py, full)?, Some(&kw))
         }
     };
+    finish_raw_call(py, name, run)
+}
+
+/// Turn the outcome of a raw entry point into CPython's convention; a panic
+/// must not unwind into C.
+fn finish_raw_call(py: Python<'_>, name: &str, run: impl FnOnce() -> PyResult<Py<PyAny>>) -> *mut ffi::PyObject {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
         Ok(Ok(result)) => result.into_ptr(),
         Ok(Err(err)) => {
@@ -414,6 +420,62 @@ unsafe fn elementwise_entry(
             std::ptr::null_mut()
         }
     }
+}
+
+type MethodBody = for<'py> fn(Python<'py>, &Bound<'py, PyAny>, &Bound<'py, PyTuple>, Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>>;
+
+/// Raw entry point of the functions with signature `(a, *args, **kwargs)`
+/// (`sum`, `mean`, `any`, ...): `np.sum(a)` reaches `body` with the shared
+/// empty tuple and no dict, so nothing is parsed or allocated.
+///
+/// # Safety
+/// Must be called by CPython with the vectorcall argument layout.
+unsafe fn method_entry(
+    name: &'static str,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+    body: MethodBody,
+) -> *mut ffi::PyObject {
+    // SAFETY: CPython calls us with the GIL held (thread attached).
+    let py = unsafe { Python::assume_attached() };
+    let nargs = (nargs as usize) & !(1usize << (usize::BITS - 1)); // PyVectorcall_NARGS
+    let run = || -> PyResult<Py<PyAny>> {
+        // SAFETY: `args` holds `nargs` positional arguments followed by one
+        // value per name in `kwnames`, all borrowed for the call.
+        unsafe {
+            let kwargs = if kwnames.is_null() {
+                None
+            } else {
+                let kw = PyDict::new(py);
+                let names = Bound::from_borrowed_ptr(py, kwnames).cast_into::<PyTuple>()?;
+                for (k, key) in names.iter().enumerate() {
+                    kw.set_item(key, Bound::from_borrowed_ptr(py, *args.add(nargs + k)))?;
+                }
+                Some(kw)
+            };
+            let a = if nargs >= 1 {
+                Bound::from_borrowed_ptr(py, *args)
+            } else {
+                // the array passed by keyword
+                match kwargs.as_ref().map(|k| k.get_item("a")).transpose()?.flatten() {
+                    Some(a) => {
+                        kwargs.as_ref().expect("checked").del_item("a")?;
+                        a
+                    }
+                    None => return Err(pyo3::exceptions::PyTypeError::new_err(format!("{name}() missing 1 required positional argument: 'a'"))),
+                }
+            };
+            let rest = if nargs <= 1 {
+                PyTuple::empty(py)
+            } else {
+                PyTuple::new(py, (1..nargs).map(|k| Bound::from_borrowed_ptr(py, *args.add(k))))?
+            };
+            let kwargs = kwargs.filter(|k| !k.is_empty());
+            body(py, &a, &rest, kwargs.as_ref())
+        }
+    };
+    finish_raw_call(py, name, run)
 }
 
 type RawFunction = unsafe extern "C" fn(*mut ffi::PyObject, *const *mut ffi::PyObject, ffi::Py_ssize_t, *mut ffi::PyObject) -> *mut ffi::PyObject;
@@ -578,9 +640,6 @@ binary_functions! {
 macro_rules! method_functions {
     ($( $name:ident => ($py_name:literal, $sig:literal) ),* $(,)?) => {
         $(
-            #[doc = concat!("`", $py_name, $sig, "`: the same as the `", $py_name, "` method for lightarray arrays (native when the arguments allow it), NumPy's function otherwise.")]
-            #[pyfunction]
-            #[pyo3(name = $py_name, signature = (a, *args, **kwargs), text_signature = $sig)]
             fn $name<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
                 if let Ok(arr) = a.cast_exact::<PyArray>() {
                     if let Some(result) = crate::python::call_native_method(arr, $py_name, args, kwargs) {
@@ -596,7 +655,13 @@ macro_rules! method_functions {
             }
         )*
         fn register_method_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
-            $( m.add_function(wrap_pyfunction!($name, m)?)?; )*
+            $( {
+                unsafe extern "C" fn raw(_module: *mut ffi::PyObject, args: *const *mut ffi::PyObject, nargs: ffi::Py_ssize_t, kwnames: *mut ffi::PyObject) -> *mut ffi::PyObject {
+                    // SAFETY: called by CPython through the method definition below.
+                    unsafe { method_entry($py_name, args, nargs, kwnames, $name) }
+                }
+                register_raw(m, concat!($py_name, "\0"), concat!($py_name, $sig, "\n--\n\nThe same as the `", $py_name, "` method for lightarray arrays (native when the arguments allow it), NumPy's function otherwise.\0"), raw)?;
+            } )*
             Ok(())
         }
     };
@@ -608,9 +673,6 @@ macro_rules! method_functions {
 macro_rules! bool_reductions {
     ($( $name:ident => ($py_name:literal, $fold:expr) ),* $(,)?) => {
         $(
-            #[doc = concat!("`", $py_name, "(a, axis=None, out=None, keepdims=False, *, where=True)`: native for lightarray arrays and NumPy bool arrays, NumPy otherwise.")]
-            #[pyfunction]
-            #[pyo3(name = $py_name, signature = (a, *args, **kwargs), text_signature = "(a, axis=None, out=None, keepdims=False, *, where=True)")]
             fn $name<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
                 if let Ok(arr) = a.cast_exact::<PyArray>() {
                     if let Some(result) = crate::python::call_native_method(arr, $py_name, args, kwargs) {
@@ -632,7 +694,13 @@ macro_rules! bool_reductions {
             }
         )*
         fn register_bool_reductions(m: &Bound<'_, PyModule>) -> PyResult<()> {
-            $( m.add_function(wrap_pyfunction!($name, m)?)?; )*
+            $( {
+                unsafe extern "C" fn raw(_module: *mut ffi::PyObject, args: *const *mut ffi::PyObject, nargs: ffi::Py_ssize_t, kwnames: *mut ffi::PyObject) -> *mut ffi::PyObject {
+                    // SAFETY: called by CPython through the method definition below.
+                    unsafe { method_entry($py_name, args, nargs, kwnames, $name) }
+                }
+                register_raw(m, concat!($py_name, "\0"), concat!($py_name, "(a, axis=None, out=None, keepdims=False, *, where=True)\n--\n\nNative for lightarray arrays and NumPy bool arrays, NumPy otherwise.\0"), raw)?;
+            } )*
             Ok(())
         }
     };
