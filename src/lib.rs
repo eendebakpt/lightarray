@@ -422,6 +422,86 @@ fn finish_raw_call(py: Python<'_>, name: &str, run: impl FnOnce() -> PyResult<Py
     }
 }
 
+/// The PyO3-parsed versions of `asarray`, `array` and `where`, which the raw
+/// fast paths below forward every call form other than the plain one to.
+static FULL_ASARRAY: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+static FULL_ARRAY: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+static FULL_WHERE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+
+/// Raw front of a PyO3 function: exactly `arity` positional arguments and no
+/// keywords run `fast` with no argument parsing; every other call is handed
+/// to the full function as it came in (a vectorcall, nothing is rebuilt).
+///
+/// # Safety
+/// Must be called by CPython with the vectorcall argument layout.
+unsafe fn fast_front(
+    name: &'static str,
+    arity: usize,
+    full: &pyo3::sync::PyOnceLock<Py<PyAny>>,
+    args: *const *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+    kwnames: *mut ffi::PyObject,
+    fast: impl FnOnce(Python<'_>, &[Bound<'_, PyAny>]) -> PyResult<Py<PyAny>>,
+) -> *mut ffi::PyObject {
+    // SAFETY: CPython calls us with the GIL held (thread attached).
+    let py = unsafe { Python::assume_attached() };
+    let count = (nargs as usize) & !(1usize << (usize::BITS - 1)); // PyVectorcall_NARGS
+    if count == arity && kwnames.is_null() {
+        let run = || -> PyResult<Py<PyAny>> {
+            // SAFETY: `args` holds `count` borrowed positional arguments.
+            unsafe {
+                let a = Bound::from_borrowed_ptr(py, *args);
+                let b = if arity > 1 { Bound::from_borrowed_ptr(py, *args.add(1)) } else { a.clone() };
+                let c = if arity > 2 { Bound::from_borrowed_ptr(py, *args.add(2)) } else { a.clone() };
+                let all = [a, b, c];
+                fast(py, &all[..arity])
+            }
+        };
+        return finish_raw_call(py, name, run);
+    }
+    match full.get(py) {
+        // SAFETY: the arguments are forwarded exactly as received.
+        Some(function) => unsafe { ffi::PyObject_Vectorcall(function.as_ptr(), args, nargs as usize, kwnames) },
+        None => {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lightarray.{name} is not initialised")).restore(py);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn asarray_raw(_module: *mut ffi::PyObject, args: *const *mut ffi::PyObject, nargs: ffi::Py_ssize_t, kwnames: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    // SAFETY: called by CPython through the method definition.
+    unsafe { fast_front("asarray", 1, &FULL_ASARRAY, args, nargs, kwnames, |py, xs| asarray(py, &xs[0], None, None, None, None)) }
+}
+
+unsafe extern "C" fn array_raw(_module: *mut ffi::PyObject, args: *const *mut ffi::PyObject, nargs: ffi::Py_ssize_t, kwnames: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    // SAFETY: called by CPython through the method definition.
+    unsafe { fast_front("array", 1, &FULL_ARRAY, args, nargs, kwnames, |py, xs| array_(py, &xs[0], None, None)) }
+}
+
+unsafe extern "C" fn where_raw(_module: *mut ffi::PyObject, args: *const *mut ffi::PyObject, nargs: ffi::Py_ssize_t, kwnames: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    // SAFETY: called by CPython through the method definition.
+    unsafe { fast_front("where", 3, &FULL_WHERE, args, nargs, kwnames, |py, xs| where_(py, &xs[0], Some(&xs[1]), Some(&xs[2]))) }
+}
+
+/// Put the raw fronts in place of the PyO3 functions registered under the same names.
+fn register_fast_fronts(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    let fronts: [(&str, &str, &pyo3::sync::PyOnceLock<Py<PyAny>>, RawFunction); 3] = [
+        ("asarray\0", "asarray(a, dtype=None, order=None, *, device=None, copy=None, like=None)\n--\n\nThe input itself when it already is a lightarray array of the requested dtype, a lightarray array for float64, int64 and bool data, NumPy's array otherwise.\0", &FULL_ASARRAY, asarray_raw),
+        ("array\0", "array(object, dtype=None, *, copy=True, order='K', subok=False, ndmin=0, like=None)\n--\n\nA new lightarray array for float64, int64 and bool data, NumPy's array otherwise.\0", &FULL_ARRAY, array_raw),
+        ("where\0", "where(condition, x=None, y=None)\n--\n\nElements of `x` where `condition` holds and of `y` elsewhere; the indices of the true elements with one argument.\0", &FULL_WHERE, where_raw),
+    ];
+    for (name, doc, slot, function) in fronts {
+        let plain = name.trim_end_matches('\0');
+        let full = m.getattr(plain)?;
+        let _ = slot.set(py, full.unbind());
+        register_raw(m, name, doc, function)?;
+        m.getattr("__all__")?.call_method1("remove", (plain,))?; // listed once, not twice
+    }
+    Ok(())
+}
+
 type MethodBody = for<'py> fn(Python<'py>, &Bound<'py, PyAny>, &Bound<'py, PyTuple>, Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>>;
 
 /// Raw entry point of the functions with signature `(a, *args, **kwargs)`
@@ -982,6 +1062,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ] {
         m.add_function(f)?;
     }
+    register_fast_fronts(m)?;
     register_unary(m)?;
     register_binary(m)?;
     register_method_functions(m)?;

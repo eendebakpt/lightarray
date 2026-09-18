@@ -1371,3 +1371,32 @@ def test_asarray_copy_and_numpy_scalars():
     assert type(la.cos(np.float64(0.0))) is np.float64
     assert type(la.cos(0.0)) is float
     assert type(la.log(np.float64(1.0))) is np.float64
+
+
+def test_raw_entry_points_keep_every_call_form():
+    """The hot functions skip argument parsing for the plain call; keywords,
+    extra arguments and errors behave as before."""
+    import inspect
+
+    from lightarray import _core
+
+    v = [0.5, 1.5, 2.5]
+    a = la.array(v)
+    assert la.asarray(a) is a and la.asarray(a, dtype=float) is a and la.asarray(a, copy=True) is not a
+    assert la.asarray(object=v).dtype == np.float64
+    check(la.array(object=v, copy=True), np.array(v))
+    assert la.array(v, dtype=np.int64).dtype == np.int64
+    check(la.where(a > 1.0, a, 0.0), np.where(np.array(v) > 1.0, v, 0.0))
+    assert np.asarray(la.where(condition=a > 1.0)[0]).tolist() == [1, 2]
+    assert float(la.sum(a)) == float(la.sum(a=a)) == 4.5
+    check(la.sum(la.ones((2, 3)), axis=0), np.full(3, 2.0))
+    check(la.sum(la.ones((2, 3)), 1, keepdims=True), np.full((2, 1), 3.0))
+    assert float(la.mean(v)) == 1.5 and bool(la.any(a > 2)) and float(la.dot(a, a)) == float(np.dot(v, v))
+    for call in (lambda: la.asarray(), lambda: la.where(), lambda: la.sum(), lambda: la.sin(), lambda: la.add(a)):
+        with pytest.raises(TypeError):
+            call()
+    with pytest.raises(TypeError):
+        la.array(v, bogus=1)
+    for name in ("asarray", "array", "where", "sum", "any", "sin", "add", "isnan", "maximum"):
+        assert "(" in str(inspect.signature(getattr(la, name)))
+        assert _core.__all__.count(name) == 1
