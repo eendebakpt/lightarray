@@ -1346,6 +1346,12 @@ def test_argsort_descending_and_nonzero_of_a_scalar():
     np.testing.assert_array_equal(
         np.asarray(la.take_along_axis(la.array(m), la.argsort(la.array(m), axis=0, descending=True), axis=0)), -np.sort(-m, axis=0)
     )
+    ties = np.zeros(40, dtype=np.uint8)
+    assert np.asarray(la.argsort(ties)).tolist() == list(range(40))  # stable by default
+    assert np.asarray(la.argsort(la.zeros((2, 40)))).tolist() == [list(range(40))] * 2
+    assert np.asarray(la.argsort(ties, descending=True)).tolist() == list(range(40))
+    nine = la.reshape(la.array(1.0), (1,) * 9)  # beyond the native eight dimensions: NumPy's
+    assert nine.shape == (1,) * 9
     with pytest.raises(ValueError):
         la.nonzero(la.array(1.0))
     with pytest.raises(ValueError):

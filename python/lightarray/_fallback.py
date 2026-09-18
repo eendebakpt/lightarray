@@ -149,6 +149,9 @@ def argsort_descending(a, *args, **kwargs):
     global calls
     calls += 1
     x = np.asarray(to_numpy(a))
+    if len(args) < 2 and "kind" not in kwargs and not kwargs.get("stable"):
+        kwargs.pop("stable", None)
+        kwargs["kind"] = "stable"  # the Array API default
     axis = args[0] if args else kwargs.pop("axis", -1)
     if axis is None:
         x, axis = x.ravel(), -1

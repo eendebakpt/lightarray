@@ -41,7 +41,10 @@ def namespace(np):
 
 
 def best(stmt, scope, number=200_000, repeat=7):
-    return min(timeit.repeat(stmt, globals=scope, number=number, repeat=repeat)) / number * 1e9
+    # an augmented assignment makes `a` local to timeit's function: bind it in the setup
+    setup = "a = a0" if "+=" in stmt else "pass"
+    scope["a0"] = scope["a"]
+    return min(timeit.repeat(stmt, setup, globals=scope, number=number, repeat=repeat)) / number * 1e9
 
 
 if __name__ == "__main__":

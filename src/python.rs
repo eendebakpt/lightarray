@@ -119,8 +119,16 @@ impl PyArray {
     /// Address of the element at a full integer index of a strided view, so
     /// scalar reads and writes skip the cache. None for other arrays and for
     /// partial indices.
+    #[inline]
     fn strided_element(&self, idx: &[isize]) -> PyResult<Option<*mut u8>> {
-        let Some(s) = &self.strided else { return Ok(None) };
+        match &self.strided {
+            None => Ok(None),
+            Some(s) => self.strided_element_at(s, idx),
+        }
+    }
+
+    #[cold]
+    fn strided_element_at(&self, s: &Strided, idx: &[isize]) -> PyResult<Option<*mut u8>> {
         let shape = self.meta().shape();
         if idx.len() != shape.len() {
             return Ok(None);
@@ -1424,6 +1432,10 @@ impl PyArray {
             return call_method_fallback(slf, "reshape", shape, kwargs);
         }
         let arr = slf.get().arr();
+        let dims = if shape.len() == 1 { shape.get_item(0)?.len().unwrap_or(1) } else { shape.len() };
+        if dims > MAX_NDIM {
+            return call_method_fallback(slf, "reshape", shape, kwargs); // a NumPy array
+        }
         let shape = extract_shape_args(shape, arr.size())?;
         if slf.get().strided.is_some() {
             return PyArray::from_any(arr.reshape(&shape)?).into_py(py);
@@ -1509,10 +1521,9 @@ impl PyArray {
                 return PyArray::from_any(AnyArray::I64(order)).into_py(slf.py());
             }
         }
-        call_method_fallback(slf, "argsort", args, kwargs)
+        call_method_fallback(slf, "argsort", args, stable_by_default(slf.py(), args, kwargs)?.as_ref())
     }
 
-    /// `.T`: reversed axes, as a copy.
     /// The array whose memory this one shares, None when it owns its data.
     #[getter]
     fn base(&self, py: Python<'_>) -> Option<Py<PyAny>> {
@@ -1940,6 +1951,22 @@ pub fn view_of_numpy(source: &Bound<'_, PyArray>, numpy_view: &Bound<'_, PyAny>)
         return Ok(None);
     }
     view_from_layout(owner, layout).map(Some)
+}
+
+/// Keywords for NumPy's `argsort` with a stable sort unless the caller chose
+/// a `kind`: the Array API makes stable the default, and NumPy promises
+/// nothing about ties, so this is valid for both.
+pub fn stable_by_default<'py>(py: Python<'py>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let kw = match kwargs {
+        Some(k) => k.copy()?,
+        None => PyDict::new(py),
+    };
+    let stable_given = kw.get_item("stable")?.map_or(false, |v| !v.is_none());
+    if args.len() < 2 && !kw.contains("kind")? && !stable_given {
+        kw.del_item("stable").ok();
+        kw.set_item("kind", "stable")?;
+    }
+    Ok(Some(kw))
 }
 
 /// `a.T`: the same memory with the axes reversed.
