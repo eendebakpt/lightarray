@@ -318,3 +318,65 @@ def test_matrix_products_with_transposes():
     np.testing.assert_allclose(np.asarray(a @ a.T), n @ n.T)
     np.testing.assert_allclose(np.asarray(a.T @ a), n.T @ n)
     np.testing.assert_allclose(np.asarray(la.dot(a.T, a[:, 0])), np.dot(n.T, n[:, 0]))
+
+
+DELEGATED_VIEWS = [
+    "a.swapaxes(0, 1)",
+    "xp.transpose(a, (1, 0))",
+    "xp.moveaxis(a, 0, 1)",
+    "a.view()",
+    "a.real",
+    "a[..., 1]",
+    "a[1, ...]",
+    "a[..., ::2]",
+    "xp.atleast_3d(a)",
+    "xp.split(a, 3)[1]",
+    "xp.hsplit(a, 2)[1]",
+    "xp.rot90(a)",
+    "xp.squeeze(a[:, None])",
+    "xp.ascontiguousarray(a)",
+    "xp.swapaxes(a[:, 1:3], 0, 1)",
+    "xp.flip(a, 1)",
+]
+
+
+@pytest.mark.parametrize("expr", DELEGATED_VIEWS)
+def test_views_returned_by_numpy_stay_views(expr):
+    """Operations NumPy performs for lightarray return views of the zero-copy
+    array handed to it; those come back as lightarray views of the same memory."""
+    a, n = pair()
+    v = eval(expr, {"a": a, "xp": la})
+    w = eval(expr, {"a": n, "xp": np})
+    assert isinstance(v, la.ndarray) and v.shape == w.shape
+    np.testing.assert_array_equal(np.asarray(v), w)
+    assert np.shares_memory(np.asarray(v), np.asarray(a))
+    assert v.base is a
+    v *= 2.0
+    w *= 2.0
+    v[(0,) * v.ndim] = -3.0
+    w[(0,) * w.ndim] = -3.0
+    np.testing.assert_array_equal(np.asarray(a), n)
+
+
+@pytest.mark.parametrize(
+    "expr", ["xp.sort(a)", "a * 1", "a[::2, [0, 1]]", "xp.diagonal(a)", "xp.broadcast_to(a, (2, 3, 4))", "xp.cumsum(a, 0)", "a.astype(int)"]
+)
+def test_copies_returned_by_numpy_stay_copies(expr):
+    a, n = pair()
+    v = eval(expr, {"a": a, "xp": la})
+    np.testing.assert_array_equal(np.asarray(v), eval(expr, {"a": n, "xp": np}))
+    assert not np.shares_memory(np.asarray(v), np.asarray(a))
+    assert getattr(v, "base", None) is None
+
+
+def test_view_of_numpy_rejects_foreign_memory():
+    from lightarray import _core
+
+    a, _ = pair()
+    assert _core._view_of(a, np.zeros(3)) is None  # not a's memory
+    assert _core._view_of(a, np.asarray(a).view(np.int64)) is None  # another dtype
+    ro = np.asarray(a)[1]
+    ro.flags.writeable = False
+    assert _core._view_of(a, ro) is None
+    inside = _core._view_of(a, np.asarray(a)[::2, ::-1])
+    assert inside.base is a and inside.strides == (64, -8)

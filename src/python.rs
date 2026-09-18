@@ -1901,6 +1901,47 @@ fn view_from_layout(slf: &Bound<'_, PyArray>, layout: Layout) -> PyResult<Py<PyA
     view.into_py(py)
 }
 
+/// A lightarray view for `numpy_view`, a NumPy array that is a view of
+/// `source`'s memory (what NumPy functions such as `swapaxes`, `split` or
+/// `a[..., 1]` return for the zero-copy array handed to them). None when the
+/// dtype differs or the view does not lie inside the owner's buffer.
+pub fn view_of_numpy(source: &Bound<'_, PyArray>, numpy_view: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    let py = source.py();
+    let owner = base_of(source);
+    let owner = owner.bind(py).cast::<PyArray>()?;
+    let meta = owner.get().meta();
+    let Ok(raw) = PyUntypedBuffer::get(numpy_view) else { return Ok(None) };
+    let itemsize = meta.itemsize();
+    let ndim = raw.dimensions();
+    if raw.readonly() || raw.item_size() != itemsize || raw.format() != meta.format() || ndim > MAX_NDIM {
+        return Ok(None);
+    }
+    let mut layout = Layout { ptr: raw.buf_ptr() as *mut u8, ndim, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] };
+    layout.shape[..ndim].copy_from_slice(raw.shape());
+    layout.strides[..ndim].copy_from_slice(raw.strides());
+    if layout.shape().iter().product::<usize>() == 0 {
+        return Ok(None);
+    }
+    // every addressed element must lie inside the owner's buffer, aligned
+    let (mut lo, mut hi) = (layout.ptr as isize, layout.ptr as isize);
+    for k in 0..ndim {
+        let reach = (layout.shape[k] as isize - 1) * layout.strides[k];
+        if layout.strides[k] % itemsize as isize != 0 {
+            return Ok(None);
+        }
+        if reach < 0 {
+            lo += reach;
+        } else {
+            hi += reach;
+        }
+    }
+    let (start, end) = meta.span();
+    if lo < start as isize || hi + itemsize as isize > end as isize || (lo - start as isize) % itemsize as isize != 0 {
+        return Ok(None);
+    }
+    view_from_layout(owner, layout).map(Some)
+}
+
 /// `a.T`: the same memory with the axes reversed.
 fn transposed(slf: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
     view_from_layout(slf, layout_of(slf).reversed())

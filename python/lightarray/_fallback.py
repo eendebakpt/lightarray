@@ -70,11 +70,29 @@ def _inside_dunder_array():
     return False
 
 
+def _lightarray_source(obj):
+    """The lightarray array whose memory the NumPy array `obj` is a writable view of, if any."""
+    base = obj.base
+    while type(base) is np.ndarray:
+        base = base.base
+    if type(base) is memoryview and isinstance(base.obj, _ndarray) and obj.flags.writeable:
+        return base.obj
+    return None
+
+
 def from_numpy(obj):
     """float64, int64 and bool ndarrays -> lightarray; other objects are returned unchanged."""
     t = type(obj)
     if t is np.ndarray:
         if obj.dtype.num in _NATIVE_NUMS and obj.ndim <= _core.MAX_NDIM and not (patch_active and _inside_dunder_array()):
+            if obj.base is not None:
+                # NumPy returned a view of an argument (swapaxes, split,
+                # a[..., 1], ...): hand back a lightarray view of the same memory
+                source = _lightarray_source(obj)
+                if source is not None:
+                    view = _core._view_of(source, obj)
+                    if view is not None:
+                        return view
             return _core.array(obj)
         return obj
     if t is tuple:

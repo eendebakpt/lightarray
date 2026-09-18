@@ -104,7 +104,15 @@ fn asarray(py: Python<'_>, object: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, P
     }
     let passthrough = match any_of(object) {
         Some(AnyArray::F64(_)) => is_float64_or_none(py, dtype)?,
-        Some(_) => dtype.map_or(true, |d| d.is_none()),
+        Some(other) => match dtype {
+            None => true,
+            Some(d) if d.is_none() => true,
+            // the array's own dtype (int64 or bool) asked for explicitly
+            Some(d) => {
+                let wanted = py.import("numpy")?.getattr("dtype")?.call1((d,))?;
+                wanted.getattr("name")?.extract::<String>()? == other.dtype_name()
+            }
+        },
         None => false,
     };
     if passthrough {
@@ -129,7 +137,17 @@ fn asarray(py: Python<'_>, object: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, P
     }
     let kw = PyDict::new(py);
     kw.set_item("dtype", dtype)?;
-    fallback(py, "call", ("array", object.clone()), Some(&kw))
+    // `asarray` shares memory when the dtype already matches; `copy` decides otherwise
+    kw.set_item("copy", copy)?;
+    if let Some(order) = order {
+        kw.set_item("order", order)?;
+    }
+    let np = py.import("numpy")?;
+    let result = np.getattr("asarray")?.call((object,), Some(&kw))?;
+    if result.is(object) {
+        return Ok(result.unbind());
+    }
+    PyArray::wrap_result(py, result)
 }
 
 /// Only the CPU device exists.
@@ -716,6 +734,13 @@ fn where_(py: Python<'_>, condition: &Bound<'_, PyAny>, x: Option<&Bound<'_, PyA
     }
 }
 
+/// `_view_of(source, numpy_view)`: a lightarray view sharing memory with
+/// `source` that has the layout of `numpy_view`, or None (see `view_of_numpy`).
+#[pyfunction]
+fn _view_of(source: &Bound<'_, PyArray>, numpy_view: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    crate::python::view_of_numpy(source, numpy_view)
+}
+
 /// `argsort(a, axis=-1, kind=None, order=None, *, stable=None, descending=False)`:
 /// the `argsort` method for lightarray arrays, NumPy's function otherwise.
 /// `descending` is the Array API keyword NumPy lacks.
@@ -817,6 +842,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(where_, m)?,
         wrap_pyfunction!(sort, m)?,
         wrap_pyfunction!(argsort, m)?,
+        wrap_pyfunction!(_view_of, m)?,
         wrap_pyfunction!(isclose, m)?,
     ] {
         m.add_function(f)?;

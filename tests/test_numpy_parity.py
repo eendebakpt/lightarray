@@ -1357,6 +1357,11 @@ def test_asarray_copy_and_numpy_scalars():
     c = la.asarray(u, copy=True)
     assert c is not u and not np.shares_memory(c, u) and c.dtype == np.uint8
     assert la.asarray(u) is u
+    assert la.asarray(u, dtype=np.uint8, copy=False) is u
+    assert not np.shares_memory(la.asarray(u, dtype=np.uint8, copy=True), u)
+    with pytest.raises(ValueError):
+        la.asarray(u, dtype=np.uint16, copy=False)
+    assert la.asarray(u, dtype=np.float64).dtype == np.float64 and isinstance(la.asarray(u, dtype=np.float64), la.ndarray)
     assert type(la.cos(np.float64(0.0))) is np.float64
     assert type(la.cos(0.0)) is float
     assert type(la.log(np.float64(1.0))) is np.float64
