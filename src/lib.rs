@@ -336,6 +336,26 @@ fn linspace(py: Python<'_>, start: &Bound<'_, PyAny>, stop: &Bound<'_, PyAny>, n
 
 // ---- element-wise math ----------------------------------------------------
 
+/// Call NumPy's `name` with `first` followed by the extra positional and
+/// keyword arguments (`out=`, `where=`, `dtype=`, ...).
+fn forward_to_numpy<'py>(
+    py: Python<'py>,
+    name: &str,
+    first: &[&Bound<'py, PyAny>],
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let mut full: Vec<Bound<'py, PyAny>> = vec![name.into_pyobject(py)?.into_any()];
+    full.extend(first.iter().map(|b| (*b).clone()));
+    full.extend(args.iter());
+    fallback(py, "call", PyTuple::new(py, full)?, kwargs)
+}
+
+#[inline]
+fn no_extras(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    args.is_empty() && kwargs.map_or(true, |k| k.is_empty())
+}
+
 /// Apply `f` to an array natively, a Python number as a float, and anything
 /// else through NumPy.
 fn unary(py: Python<'_>, name: &str, x: &Bound<'_, PyAny>, f: fn(f64) -> f64) -> PyResult<Py<PyAny>> {
@@ -363,7 +383,11 @@ macro_rules! unary_functions {
         $(
             #[doc = concat!("Element-wise `", stringify!($name), "` with NumPy semantics: native for lightarray arrays (returns lightarray) and Python numbers (returns float), NumPy for anything else.")]
             #[pyfunction]
-            fn $name(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+            #[pyo3(signature = (x, /, *args, **kwargs), text_signature = "(x, /, out=None, *, where=True, dtype=None)")]
+            fn $name<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+                if !no_extras(args, kwargs) {
+                    return forward_to_numpy(py, stringify!($name), &[x], args, kwargs);
+                }
                 unary(py, stringify!($name), x, $f)
             }
         )*
@@ -397,7 +421,11 @@ macro_rules! predicate_functions {
         $(
             #[doc = concat!("Element-wise `", stringify!($name), "` with NumPy semantics: native for float64 lightarray arrays (returns a bool lightarray) and Python numbers (returns np.bool_), NumPy otherwise.")]
             #[pyfunction]
-            fn $name(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+            #[pyo3(signature = (x, /, *args, **kwargs), text_signature = "(x, /, out=None, *, where=True)")]
+            fn $name<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+                if !no_extras(args, kwargs) {
+                    return forward_to_numpy(py, stringify!($name), &[x], args, kwargs);
+                }
                 let f: fn(f64) -> bool = $f;
                 if let Some(a) = f64_of(x) {
                     return PyArray::from_any(AnyArray::Bool(compare_scalar(a, f))).into_py(py);
@@ -429,7 +457,11 @@ macro_rules! binary_functions {
         $(
             #[doc = concat!("Element-wise `", stringify!($name), "(x1, x2)` with NumPy semantics and broadcasting: native when either operand is a lightarray array, NumPy otherwise.")]
             #[pyfunction]
-            fn $name(py: Python<'_>, x1: &Bound<'_, PyAny>, x2: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+            #[pyo3(signature = (x1, x2, /, *args, **kwargs), text_signature = "(x1, x2, /, out=None, *, where=True, dtype=None)")]
+            fn $name<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+                if !no_extras(args, kwargs) {
+                    return forward_to_numpy(py, stringify!($name), &[x1, x2], args, kwargs);
+                }
                 let r = if x1.is_instance_of::<PyArray>() {
                     x1.call_method1($dunder, (x2,))?
                 } else if x2.is_instance_of::<PyArray>() {
@@ -542,7 +574,11 @@ macro_rules! binary_math_functions {
         $(
             #[doc = concat!("Element-wise `", stringify!($name), "(x1, x2)` with NumPy semantics and broadcasting: native for lightarray arrays and scalars, NumPy otherwise.")]
             #[pyfunction]
-            fn $name(py: Python<'_>, x1: &Bound<'_, PyAny>, x2: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+            #[pyo3(signature = (x1, x2, /, *args, **kwargs), text_signature = "(x1, x2, /, out=None, *, where=True, dtype=None)")]
+            fn $name<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+                if !no_extras(args, kwargs) {
+                    return forward_to_numpy(py, stringify!($name), &[x1, x2], args, kwargs);
+                }
                 binary_native(py, stringify!($name), x1, x2, $f)
             }
         )*

@@ -219,3 +219,22 @@ def test_isinstance_checks_inside_patched_packages_accept_lightarray():
         assert mod.kind([1.0, 2.0]) == (False, False, False)
         assert isinstance(mod.make(), numpy.ndarray)
     assert mod.kind(lightarray.ones(2)) == (False, False, False)
+
+
+def test_proxies_survive_copy_and_pickle():
+    import copy
+    import pickle
+    import types
+
+    mod = types.ModuleType("fake_pkg4")
+    mod.add = numpy.add
+    for mode in ("lightarray", "numpy"):
+        lightarray.patch_module(mod, conversions=mode)
+        try:
+            proxy = mod.add
+            assert proxy is not numpy.add
+            assert copy.deepcopy(proxy) is proxy and copy.copy(proxy) is proxy
+            assert pickle.loads(pickle.dumps(proxy)) is numpy.add
+            assert copy.deepcopy({"f": proxy})["f"] is proxy
+        finally:
+            lightarray.unpatch_module(mod)

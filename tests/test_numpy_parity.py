@@ -1312,3 +1312,25 @@ def test_shape_assignment_reshapes_in_place():
     i = la.arange(4)
     i.shape = (2, 2)
     assert i.shape == (2, 2) and i.strides == (16, 8)
+
+
+def test_out_arguments_return_the_callers_object():
+    x, y = rng_data(4), rng_data(4, 5)
+    a, b = la.array(x), la.array(y)
+    out = la.zeros(4)
+    assert la.add(a, b, out=out) is out
+    check(out, x + y)
+    assert la.sin(a, out=out) is out
+    check(out, np.sin(x))
+    assert la.multiply(a, 2.0, out) is out  # positional out
+    check(out, x * 2.0)
+    assert np.add(a, b, out=out) is out  # NumPy's own ufunc with a lightarray out
+    check(out, x + y)
+    big = la.zeros(8)
+    assert la.concatenate([a, b], out=big) is big
+    check(big, np.concatenate([x, y]))
+    nout = np.zeros(4)
+    assert la.add(a, b, out=nout) is nout
+    np.testing.assert_allclose(nout, x + y)
+    check(la.sqrt(la.array([4.0, -1.0, 9.0]), where=np.array([True, False, True]), out=la.zeros(3)), np.array([2.0, 0.0, 3.0]))
+    check(la.add(a, b, dtype=np.float64), x + y)

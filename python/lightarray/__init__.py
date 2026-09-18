@@ -236,7 +236,8 @@ def flip(m, axis=None):
 
 def diff(a, n=1, axis=-1, prepend=None, append=None):
     a = asarray(a)  # noqa: F405
-    if prepend is not None or append is not None or n != 1 or not isinstance(a, ndarray) or a.ndim == 0:
+    # (bool arrays difference with xor in NumPy, so they go there)
+    if prepend is not None or append is not None or n != 1 or not isinstance(a, ndarray) or a.ndim == 0 or a.dtype == _np.bool_:
         kwargs = {k: v for k, v in (("prepend", prepend), ("append", append)) if v is not None}
         return _fallback.call("diff", a, n=n, axis=axis, **kwargs)
     ax = axis + a.ndim if axis < 0 else axis
@@ -427,7 +428,18 @@ class _TypePreservingUfunc:
         return self._dispatch(*args, **kwargs)
 
     def __getattr__(self, name):
+        if name.startswith("_"):  # also stops copy/pickle probing from recursing
+            raise AttributeError(name)
         return _builtins.getattr(self._ufunc, name)
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return (_fallback._numpy_ufunc, (self._ufunc.__name__,))
 
 
 class _ConversionsToNumpy(_types.ModuleType):

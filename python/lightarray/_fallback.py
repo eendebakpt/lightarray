@@ -101,8 +101,22 @@ def invoke(func, args, kwargs):
     global calls
     calls += 1
     if kwargs:
-        return from_numpy(func(*_args_to_numpy(args), **_kwargs_to_numpy(kwargs)))
-    return from_numpy(func(*_args_to_numpy(args)))
+        result = func(*_args_to_numpy(args), **_kwargs_to_numpy(kwargs))
+        out = kwargs.get("out")
+        if out is not None:
+            # NumPy wrote into `out` (through the writable view when it is a
+            # lightarray array) and returns it; hand back the caller's object.
+            if isinstance(out, tuple):
+                return out[0] if len(out) == 1 else out
+            return out
+        return from_numpy(result)
+    result = func(*_args_to_numpy(args))
+    if type(func) is np.ufunc and len(args) > func.nin:
+        # ufunc called with positional `out` arguments
+        outs = args[func.nin :]
+        if all(o is not None for o in outs):
+            return outs[0] if len(outs) == 1 else tuple(outs)
+    return from_numpy(result)
 
 
 def call(name, *args, **kwargs):
@@ -174,6 +188,8 @@ class ModuleProxy:
         self._module = module
 
     def __getattr__(self, name):
+        if name.startswith("__") or name == "_module":
+            raise AttributeError(name)
         obj = getattr(self._module, name)
         if isinstance(obj, types.ModuleType):
             obj = ModuleProxy(obj)
@@ -191,6 +207,11 @@ class ModuleProxy:
 
 # Private NumPy names that other libraries (SciPy) reach for anyway.
 _PRIVATE_PASSTHROUGH = ("_CopyMode", "_NoValue")
+
+
+def _numpy_ufunc(name):
+    """Pickle helper: proxies unpickle as the NumPy ufunc they stand for."""
+    return getattr(np, name)
 
 
 class UfuncProxy:
@@ -211,8 +232,19 @@ class UfuncProxy:
         return self._call(*args, **kwargs)
 
     def __getattr__(self, name):
+        if name.startswith("_"):  # also stops copy/pickle probing from recursing
+            raise AttributeError(name)
         attr = getattr(self._ufunc, name)
         return wrap_function(attr) if callable(attr) else attr
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return (_numpy_ufunc, (self._ufunc.__name__,))  # unpickles as the NumPy ufunc
 
     def __repr__(self):
         return f"<lightarray proxy of ufunc '{self._ufunc.__name__}'>"
@@ -280,8 +312,13 @@ _NATIVE_UFUNCS = {}  # numpy ufunc -> lightarray native function, filled lazily
 
 def _array_ufunc(self, ufunc, method, *inputs, **kwargs):
     if kwargs.get("out") is not None:
-        # NumPy writes into `out` and returns it; hand it back untouched.
-        return getattr(ufunc, method)(*_args_to_numpy(inputs), **_kwargs_to_numpy(kwargs))
+        # NumPy writes into `out` (through the view for lightarray arrays)
+        # and returns it; hand back the caller's own object.
+        getattr(ufunc, method)(*_args_to_numpy(inputs), **_kwargs_to_numpy(kwargs))
+        out = kwargs["out"]
+        if isinstance(out, tuple):
+            return out[0] if len(out) == 1 else out
+        return out
     if method == "__call__" and not kwargs:
         native = _NATIVE_UFUNCS.get(ufunc)
         if native is not None:

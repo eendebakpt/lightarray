@@ -134,3 +134,31 @@ def test_two_argument_numpy_function_on_lightarray_does_not_crash(name):
             np.testing.assert_allclose(np.asarray(result), expected, rtol=1e-10, atol=1e-12, err_msg=name)
         elif isinstance(expected, (float, np.floating)):
             np.testing.assert_allclose(float(result), float(expected), rtol=1e-10, err_msg=name)
+
+
+@pytest.mark.parametrize("name", list(_candidates()))
+@pytest.mark.parametrize("kind", ["int64", "bool"])
+def test_numpy_function_on_int_and_bool_lightarray(name, kind):
+    """The sweep again for the int64 and bool dtypes: no crashes, and the
+    same values and dtype as NumPy whenever both succeed."""
+    if kind == "int64":
+        x = np.array([[3, -1, 4], [1, 5, -9]])
+    else:
+        x = np.array([[True, False, True], [False, False, True]])
+    a = la.array(x)
+    assert isinstance(a, la.ndarray) and a.dtype == x.dtype
+    outcomes = []
+    for arg in (x, a):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                outcomes.append(("ok", getattr(np, name)(arg)))
+        except Exception as e:  # noqa: BLE001
+            outcomes.append(("err", type(e)))
+    (kind_np, val_np), (kind_la, val_la) = outcomes
+    if kind_np == "ok" and kind_la == "err":
+        pytest.fail(f"np.{name} works on a NumPy {kind} array but raised {val_la.__name__} on lightarray")
+    if kind_np == "ok" and kind_la == "ok" and isinstance(val_np, np.ndarray) and val_np.dtype.kind in "fib":
+        got = np.asarray(val_la)
+        assert got.dtype == val_np.dtype, (name, got.dtype, val_np.dtype)
+        np.testing.assert_allclose(got.astype(float), val_np.astype(float), rtol=1e-10, atol=1e-12, err_msg=name, equal_nan=True)
