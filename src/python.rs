@@ -102,8 +102,11 @@ impl PyArray {
         unsafe { &*self.inner.get() }
     }
 
-    /// Reload a strided view's cache from the base's memory.
-    #[cold]
+    /// Reload a strided view's cache from the base's memory. Kept out of
+    /// line so that `arr()` stays one branch for ordinary arrays, but not
+    /// `#[cold]`: for a strided view this is the hot path, and cold functions
+    /// are optimised for size.
+    #[inline(never)]
     fn refresh(&self) {
         if let Some(s) = &self.strided {
             // SAFETY: `s.ptr`/`s.strides` address elements of `s.base`'s

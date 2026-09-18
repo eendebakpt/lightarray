@@ -2,7 +2,8 @@
 
 `gate.py` has loose absolute limits so that shared CI runners pass; a 30%
 regression slips through it. This script compares against a baseline recorded
-on *this* machine and fails on a few percent:
+on *this* machine and fails when the build as a whole is more than 1% slower
+or any single operation more than 6%:
 
     python benchmarks/perf_check.py --save     # record the baseline (on a commit you trust)
     python benchmarks/perf_check.py            # compare; exit 1 on any regression
@@ -14,7 +15,7 @@ Workflow: save a baseline before starting on a feature, rebuild with
 `--save` again.
 
 How it stays quiet on a noisy machine:
-- timings are taken in several fresh processes (`--processes`, 3), each pinned
+- timings are taken in several fresh processes (`--processes`, 5), each pinned
   to one core (`--cpu`, Linux); the minimum over all processes and rounds
   counts. Separate processes matter: heap and address-space layout differ per
   process and shift allocation-heavy operations by up to 8%, which no number
@@ -27,16 +28,22 @@ How it stays quiet on a noisy machine:
   or throttled and the script refuses to judge (exit code 2);
 - an operation that looks regressed is re-measured in further fresh
   processes before it is reported;
-- a regression must exceed both the relative tolerance (`--tolerance`, 4%)
-  and an absolute one (`--min-ns`, 2.5 ns).
+- a single operation must exceed both the relative tolerance (`--tolerance`,
+  6%) and an absolute one (`--min-ns`, 2.5 ns); the build as a whole (geometric
+  mean over all operations) must not be more than `--overall-tolerance` (1%)
+  slower.
 
-What it cannot remove is the code-layout effect between two *builds*: adding
-any code, even an unused method, moves the hot functions and changes inlining,
-which shifts single operations by 3-8% in both directions. `.cargo/config.toml`
-aligns all functions to 64 bytes to dampen this, and the summary line reports
-the overall (geometric mean) change, so a layout shift (overall about 0, as
-many operations faster as slower) can be told from a real regression (the
-operations touched by the change slower, nothing gained).
+Why two criteria: between two *builds* there is a code-layout effect that no
+amount of measuring removes. Adding any code, even an unused method or an
+attribute on an unrelated function, moves the hot functions and changes
+inlining, which shifts a handful of operations by 3-5% in both directions
+(measured: three different source changes each moved a different set, while
+the overall change stayed within 0.6%). `.cargo/config.toml` aligns all
+functions to 64 bytes to dampen this. The overall change is therefore the
+sensitive criterion, and the per-operation limit sits just above the layout
+noise; what it still catches is a path whose inlining really changed (+7-10%
+on `np.array(list)`, fixed by pinning it with `#[inline(never)]`) and
+anything on the scale of argument-parsing overhead (+12% and more).
 
 The baseline is machine-specific and therefore not committed
 (`benchmarks/.perf_baseline.json`).
@@ -270,9 +277,17 @@ def main():
     parser.add_argument("--save", action="store_true", help="record the current timings as the baseline")
     parser.add_argument("--baseline", type=Path, default=BASELINE, help="baseline file (default: %(default)s)")
     parser.add_argument("-k", dest="select", default="", help="only operations whose statement or group contains this text")
-    parser.add_argument("--tolerance", type=float, default=0.04, help="relative slowdown that counts as a regression (default 0.04)")
+    parser.add_argument(
+        "--tolerance", type=float, default=0.06, help="relative slowdown of one operation that counts as a regression (default 0.06)"
+    )
+    parser.add_argument(
+        "--overall-tolerance",
+        type=float,
+        default=0.01,
+        help="slowdown of the geometric mean over all operations that fails the check (default 0.01)",
+    )
     parser.add_argument("--min-ns", type=float, default=2.5, help="absolute slowdown a regression must also exceed (default 2.5 ns)")
-    parser.add_argument("--processes", type=int, default=3, help="fresh processes to measure in; the minimum counts (default 3)")
+    parser.add_argument("--processes", type=int, default=5, help="fresh processes to measure in; the minimum counts (default 5)")
     parser.add_argument("--rounds", type=int, default=5, help="measurements per operation and process (default 5)")
     parser.add_argument("--cpu", type=int, default=2, help="core to pin the measurements to on Linux (default 2); -1 to not pin")
     parser.add_argument(
@@ -295,6 +310,8 @@ def main():
     if args.save:
         if args.select:
             sys.exit("--save records every operation; drop -k")
+        if hasattr(os, "getloadavg") and os.getloadavg()[0] > 1.5:
+            print(f"warning: load average {os.getloadavg()[0]:.1f}; a baseline recorded on a busy machine makes later checks too lenient")
         data = {"environment": environment(cpu), "reference_ns": measured.reference, "timings_ns": measured.timings}
         args.baseline.write_text(json.dumps(data, indent=1) + "\n")
         for group, statement in selected:
@@ -359,26 +376,37 @@ def main():
             improvements.append(statement)
 
     ratios = [measured.timings[s] / base["timings_ns"][s] for s in statements if s in base["timings_ns"]]
+    overall_failed = False
     if ratios:
-        overall = math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1
+        # judged like single operations: raw and scaled by the reference, the smaller slowdown counts
+        raw = math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1
+        overall = min(raw, (1 + raw) / scale - 1)
         slower, faster = sum(r > 1.03 for r in ratios), sum(r < 0.97 for r in ratios)
-        print(f"\noverall (geometric mean) {overall:+.2%}; {slower} operation(s) more than 3% slower, {faster} more than 3% faster")
-        if regressions and abs(overall) < 0.01 and faster >= slower:
+        overall_failed = not args.select and overall > args.overall_tolerance
+        print(
+            f"\noverall (geometric mean) {raw:+.2%}; {slower} operation(s) more than 3% slower, {faster} more than 3% faster"
+            + ("  REGRESSION" if overall_failed else "")
+        )
+        if regressions and not overall_failed and faster >= slower:
             print(
-                "note: the build as a whole is not slower and as many operations gained as lost. That is the\n"
-                "signature of a code-layout shift (any added code moves the hot functions), not of the change\n"
-                "itself; check by building the same change under another name, or pin the inlining of the\n"
-                "affected path (#[inline(never)] / #[inline(always)])."
+                "note: the build as a whole is not slower and as many operations gained as lost, the signature of\n"
+                "a code-layout shift. Pin the inlining of the affected path (#[inline(never)] / #[inline(always)])\n"
+                "if the operation matters, and confirm with a control build of the same change under another name."
             )
     print()
     if new:
         print(f"{len(new)} operation(s) not in the baseline (run --save to include them): {', '.join(new)}")
     if improvements:
         print(f"{len(improvements)} faster than the baseline: {', '.join(improvements)} (run --save to lock that in)")
+    if overall_failed:
+        print(f"REGRESSION: the build as a whole is more than {args.overall_tolerance:.0%} slower")
     if regressions:
         print(f"{len(regressions)} REGRESSION(S): {', '.join(regressions)}")
+    if regressions or overall_failed:
         return 1
-    print(f"no regressions in {len(selected)} operations (tolerance {args.tolerance:.0%} and {args.min_ns} ns)")
+    print(
+        f"no regressions in {len(selected)} operations (overall within {args.overall_tolerance:.0%}, each within {args.tolerance:.0%} or {args.min_ns} ns)"
+    )
     return 0
 
 

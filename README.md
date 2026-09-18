@@ -166,7 +166,7 @@ cargo test --release --lib      # kernel tests
 benchmarks/carray_reference/build.sh && python benchmarks/bench_overhead.py
 python benchmarks/gate.py       # coarse performance gate with absolute limits (CI)
 python benchmarks/perf_check.py --save   # record this machine's timings of 70 key operations ...
-python benchmarks/perf_check.py          # ... and fail when a later build is more than 4% slower
+python benchmarks/perf_check.py          # ... and fail when a later build is slower (1% overall, 6% per operation)
 python examples/lmfit_model_fit.py   # lmfit example running on lightarray
 python examples/lmfit_internals.py   # lmfit's own internals rebound to lightarray
 ```
