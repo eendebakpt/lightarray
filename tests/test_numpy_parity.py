@@ -1402,36 +1402,37 @@ def test_raw_entry_points_keep_every_call_form():
         assert _core.__all__.count(name) == 1
 
 
-def test_array_api_details_numpy_lacks():
-    """finfo with Python floats, fftfreq(dtype=) and the complex special cases
-    of expm1: the Array API asks for them and NumPy does not provide them."""
-    info = la.finfo(np.float32)
-    assert type(info.eps) is float and type(info.max) is float and type(info.smallest_normal) is float
-    assert info.eps == float(np.finfo(np.float32).eps) and info.bits == 32 and info.dtype == np.float32
-    assert (np.ones(2, np.float32) + info.eps).dtype == np.float32  # a weak scalar: the dtype survives
-    assert type(la.finfo(np.complex64).max) is float and la.finfo(np.complex64).dtype == np.float32
-    assert la.finfo(np.float64).eps == np.finfo(np.float64).eps and la.finfo(la.zeros(2)).bits == 64
+def test_numpy_wins_where_it_differs_from_the_array_api():
+    """lightarray follows NumPy where NumPy and the Array API disagree. These
+    are known upstream: finfo scalars (data-apis/array-api#405), complex expm1
+    (numpy#21746), floor_divide of infinities (NumPy follows Python)."""
+    for dtype in (np.float32, np.float64, np.complex64):
+        ours, theirs = la.finfo(dtype), np.finfo(dtype)
+        assert type(ours) is type(theirs) and type(ours.eps) is type(theirs.eps) and ours.eps == theirs.eps
+    assert la.finfo(la.zeros(2)).bits == 64
 
+    inf, nan = np.inf, np.nan
+    with np.errstate(all="ignore"):
+        z = np.array([complex(inf, 0.0), complex(-inf, inf), 0.5 - 2j])
+        np.testing.assert_array_equal(la.expm1(z), np.expm1(z))
+
+        values = [inf, -inf, 0.0, -0.0, 1.5, -1.5, 2.0, -2.0, nan, 1e308, 5e-324, 7.0, 0.1, -0.3]
+        x = np.repeat(values, len(values))
+        y = np.tile(values, len(values))
+        for op in (lambda p, q: p // q, lambda p, q: p % q, lambda p, q: p / q, lambda p, q: p**q):
+            expected = op(x, y)
+            result = np.asarray(op(la.array(x), la.array(y)))
+            np.testing.assert_array_equal(result, expected)
+            np.testing.assert_array_equal(np.signbit(result), np.signbit(expected))
+        check(la.floor_divide(la.array(x), 3.0), np.floor_divide(x, 3.0))
+        a = la.array(x)
+        a //= la.array(y)
+        np.testing.assert_array_equal(np.asarray(a), x // y)
+
+
+def test_fftfreq_takes_the_array_api_dtype_keyword():
+    """An addition NumPy lacks (numpy#9126); nothing NumPy does is changed."""
     assert la.fft.fftfreq(4, dtype=np.float32).dtype == np.float32
     check(la.fft.fftfreq(5, 0.5), np.fft.fftfreq(5, 0.5))
     check(la.fft.rfftfreq(6, d=2.0), np.fft.rfftfreq(6, d=2.0))
     assert la.fft.rfftfreq(4, dtype=np.float32).dtype == np.float32
-
-    inf, nan = np.inf, np.nan
-    cases = [
-        (complex(-0.0, 0.0), 0j),
-        (complex(inf, 0.0), complex(inf, 0.0)),
-        (complex(-inf, inf), -1 + 0j),
-        (complex(-inf, nan), -1 + 0j),
-        (complex(nan, 0.0), complex(nan, 0.0)),
-    ]
-    with np.errstate(all="ignore"):
-        for value, expected in cases:
-            for result in (la.expm1(np.complex128(value)), la.expm1(np.array([value, 1 + 1j]))[0]):
-                assert np.array_equal(np.array(result), np.array(expected), equal_nan=True), (value, result)
-        z = np.array([1e-10 + 1e-10j, 0.5 - 2j, complex(inf, inf)])
-        r = la.expm1(z)
-        np.testing.assert_array_equal(r[:2], np.expm1(z[:2]))  # ordinary values keep expm1's precision
-        assert np.isinf(r[2].real) and np.isnan(r[2].imag)
-        assert la.expm1(z.astype(np.complex64)).dtype == np.complex64
-    check(la.expm1(la.array([1e-10, 0.0, 2.0])), np.expm1(np.array([1e-10, 0.0, 2.0])))

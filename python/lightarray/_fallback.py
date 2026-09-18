@@ -137,34 +137,9 @@ def invoke(func, args, kwargs):
     return from_numpy(result)
 
 
-def _expm1(x, *args, **kwargs):
-    """`numpy.expm1`, with the complex special cases NumPy gets wrong
-    (`expm1(inf+0j)` is `inf+nanj` there, `expm1(-inf+infj)` is `nan+nanj`):
-    for non-finite and zero inputs `exp(x) - 1` has the values IEEE and the
-    Array API specify, and loses no precision."""
-    result = np.expm1(x, *args, **kwargs)
-    if isinstance(result, (np.ndarray, np.complexfloating)) and result.dtype.kind == "c":
-        z = np.asarray(x)
-        special = ~np.isfinite(z) | (z == 0)
-        if "where" in kwargs:
-            special &= kwargs["where"]
-        if special.any():
-            with np.errstate(all="ignore"):
-                fixed = (np.exp(z) - 1).astype(result.dtype, copy=False)
-            if isinstance(result, np.ndarray):
-                np.copyto(result, fixed, where=special)
-            else:
-                result = fixed[()]
-    return result
-
-
-# NumPy functions called through a corrected version.
-_CORRECTED = {"expm1": _expm1}
-
-
 def call(name, *args, **kwargs):
     """Call NumPy's `name` with converted arguments."""
-    return invoke(_CORRECTED.get(name) or getattr(np, name), args, kwargs)
+    return invoke(getattr(np, name), args, kwargs)
 
 
 def argsort_descending(a, *args, **kwargs):

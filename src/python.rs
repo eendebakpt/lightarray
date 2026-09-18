@@ -672,8 +672,28 @@ pub fn where_native(py: Python<'_>, cond: &Bound<'_, PyAny>, x: &Bound<'_, PyAny
     }
 }
 
+/// NumPy's float `floor_divide` (`npy_divmod`), which follows Python rather
+/// than the Array API: computed from `fmod`, so `inf // 2` is NaN and
+/// `1.5 // -inf` is -1.0, and results are exact where `(a / b).floor()` rounds.
 fn float_floor_div(a: f64, b: f64) -> f64 {
-    (a / b).floor()
+    if b == 0.0 {
+        return a / b;
+    }
+    let rem = a % b;
+    let mut div = (a - rem) / b;
+    if rem != 0.0 && ((b < 0.0) != (rem < 0.0)) {
+        div -= 1.0;
+    }
+    if div != 0.0 {
+        let floored = div.floor();
+        if div - floored > 0.5 {
+            floored + 1.0
+        } else {
+            floored
+        }
+    } else {
+        (0.0f64).copysign(a / b)
+    }
 }
 
 /// Python/NumPy remainder: result has the sign of the divisor.

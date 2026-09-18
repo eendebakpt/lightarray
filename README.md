@@ -137,13 +137,15 @@ is cheap for small arrays and one extra pass over the data for large ones.
 Views that NumPy returns for delegated operations (`swapaxes`, `split`,
 `a[..., 1]`) stay views as well.
 
-Against the official Array API test suite lightarray passes 1372 of 1374
-tests, more than NumPy itself: `finfo` returns Python floats, `fft.fftfreq`
-takes `dtype=`, and complex `expm1` follows IEEE for infinities. The two that
-remain are decided inside NumPy or by C99: indexing a NumPy array with an
-*empty* lightarray bool mask (NumPy casts any empty non-ndarray index to
-integers), and the sign of the zero in `tanh(inf + iy)`, where NumPy, C99 and
-Python's `cmath` agree with each other and not with the test.
+Where NumPy and the Array API disagree, lightarray follows NumPy. Against the
+official Array API test suite it passes 1346 of 1374 tests; 27 of the 28
+failures are tests NumPy lists as expected failures of its own
+(`tools/ci/array-api-xfails.txt`): `finfo` returning NumPy scalars, complex
+`expm1` at infinities (numpy#21746) and `floor_divide` of infinities, where
+NumPy follows Python. The last one is indexing a NumPy array with an *empty*
+lightarray bool mask, which NumPy casts to an integer index. lightarray does
+add the Array API keywords NumPy lacks (`sort(descending=)`,
+`fft.fftfreq(dtype=)`), since they change nothing NumPy does.
 
 ## Development
 

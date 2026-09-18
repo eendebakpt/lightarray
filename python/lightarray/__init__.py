@@ -88,32 +88,13 @@ def ndim(a):
     return asarray(a).ndim  # noqa: F405
 
 
-class _FloatInfo:
-    """`numpy.finfo` of a dtype other than float64, with Python floats for
-    `eps`, `max`, `min`, `smallest_normal`, ... as the Array API asks
-    (NumPy gives `np.float32`, which is not a `float`). Python floats are weak
-    in NumPy's promotion, so `x + finfo(x.dtype).eps` keeps `x`'s dtype."""
-
-    __slots__ = ("_info",)
-
-    def __init__(self, info):
-        self._info = info
-
-    def __getattr__(self, name):
-        value = getattr(self._info, name)
-        return float(value) if isinstance(value, _np.floating) else value
-
-    def __repr__(self):
-        return repr(self._info)
-
-
 def finfo(dtype):
-    """NumPy's finfo, also accepting arrays (Array API) and lightarray arrays."""
+    """NumPy's finfo, also accepting arrays (Array API) and lightarray arrays.
+    The values are NumPy scalars, as in NumPy (the Array API says Python
+    floats; see data-apis/array-api#405)."""
     if isinstance(dtype, (ndarray, _np.ndarray)):
         dtype = dtype.dtype
-    info = _np.finfo(dtype)
-    # float64 values are np.float64, which is a Python float already
-    return info if info.dtype == _np.float64 else _FloatInfo(info)
+    return _np.finfo(dtype)
 
 
 def iinfo(int_type):
