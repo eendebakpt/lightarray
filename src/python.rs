@@ -524,6 +524,76 @@ pub fn round_half_even(x: f64) -> f64 {
     if (x - x.trunc()).abs() == 0.5 { 2.0 * (x / 2.0).round() } else { r }
 }
 
+/// The array methods with the uniform `(*args, **kwargs)` signature, for the
+/// module-level functions (`np.sum(a)` is `a.sum()`): calling the Rust method
+/// directly saves the Python-level method call, about 170 ns. None for other names.
+pub fn call_native_method<'py>(
+    slf: &Bound<'py, PyArray>,
+    name: &str,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> Option<PyResult<Py<PyAny>>> {
+    Some(match name {
+        "sum" => PyArray::sum(slf, args, kwargs),
+        "prod" => PyArray::prod(slf, args, kwargs),
+        "mean" => PyArray::mean(slf, args, kwargs),
+        "max" => PyArray::max(slf, args, kwargs),
+        "min" => PyArray::min(slf, args, kwargs),
+        "var" => PyArray::var(slf, args, kwargs),
+        "std" => PyArray::std(slf, args, kwargs),
+        "argmax" => PyArray::argmax(slf, args, kwargs),
+        "argmin" => PyArray::argmin(slf, args, kwargs),
+        "any" => PyArray::any(slf, args, kwargs),
+        "all" => PyArray::all(slf, args, kwargs),
+        "cumsum" => PyArray::cumsum(slf, args, kwargs),
+        "cumprod" => PyArray::cumprod(slf, args, kwargs),
+        "clip" => PyArray::clip(slf, args, kwargs),
+        "round" => PyArray::round(slf, args, kwargs),
+        "reshape" => PyArray::reshape(slf, args, kwargs),
+        "copy" => PyArray::copy(slf, args, kwargs),
+        "ravel" => PyArray::ravel(slf, args, kwargs),
+        "transpose" => PyArray::transpose(slf, args, kwargs),
+        "dot" if args.len() == 1 && kwargs.map_or(true, |k| k.is_empty()) => match args.get_item(0) {
+            Ok(other) => PyArray::dot(slf, &other),
+            Err(e) => Err(e),
+        },
+        _ => return None,
+    })
+}
+
+/// `add(x1, x2)` and the other operator functions: the operator itself,
+/// called directly (going through the Python-level `__add__` costs 170 ns).
+/// `name` is the ufunc's name. None when neither operand is a lightarray
+/// array or the operator does not handle the pair.
+pub fn operator_function(name: &str, x1: &Bound<'_, PyAny>, x2: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyAny>>> {
+    let f: fn(f64, f64) -> f64 = match name {
+        "add" => |a, b| a + b,
+        "subtract" => |a, b| a - b,
+        "multiply" => |a, b| a * b,
+        "divide" | "true_divide" => |a, b| a / b,
+        "floor_divide" => float_floor_div,
+        "remainder" | "mod" => float_mod,
+        "power" => float_pow,
+        _ => return Ok(None),
+    };
+    let ufunc = match name {
+        "true_divide" => "divide",
+        "mod" => "remainder",
+        other => other,
+    };
+    let result = if let Ok(a) = x1.cast::<PyArray>() {
+        binary_op(a, x2, false, ufunc, f)?
+    } else if let Ok(b) = x2.cast::<PyArray>() {
+        binary_op(b, x1, true, ufunc, f)?
+    } else {
+        return Ok(None);
+    };
+    if result.bind(x1.py()).is(&PyNotImplemented::get(x1.py())) {
+        return Ok(None);
+    }
+    Ok(Some(result))
+}
+
 /// Module-level binary function (`maximum`, `arctan2`, ...): native for
 /// array/array of equal shape and array/scalar either way, NumPy otherwise.
 pub fn binary_native(
@@ -2083,6 +2153,14 @@ fn extract_shape_args(args: &Bound<'_, PyTuple>, size: usize) -> PyResult<Vec<us
 
 /// `shape` argument of creation functions: an int or a sequence of ints.
 pub fn extract_shape(shape: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+    // Type checks first: a failed `extract` builds and drops a Python
+    // exception, which costs more than making the array.
+    if shape.is_instance_of::<PyInt>() {
+        return Ok(vec![shape.extract::<usize>()?]);
+    }
+    if let Ok(tuple) = shape.cast::<PyTuple>() {
+        return tuple.iter().map(|d| d.extract::<usize>()).collect::<PyResult<_>>().map_err(|_| PyTypeError::new_err("shape must be an int or a sequence of ints"));
+    }
     if let Ok(n) = shape.extract::<usize>() {
         return Ok(vec![n]);
     }

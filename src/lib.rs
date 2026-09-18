@@ -212,7 +212,7 @@ fn is_float64_or_none(py: Python<'_>, dtype: Option<&Bound<'_, PyAny>>) -> PyRes
 
 fn filled(py: Python<'_>, shape: &Bound<'_, PyAny>, value: f64, dtype: Option<&Bound<'_, PyAny>>, name: &str) -> PyResult<Py<PyAny>> {
     // More dimensions than lightarray holds natively: let NumPy make the array.
-    let too_many_dims = shape.len().map_or(false, |n| n > MAX_NDIM);
+    let too_many_dims = !shape.is_instance_of::<pyo3::types::PyInt>() && shape.len().map_or(false, |n| n > MAX_NDIM);
     if too_many_dims || called_from_dunder_array(py) || !is_float64_or_none(py, dtype)? {
         let kw = PyDict::new(py);
         kw.set_item("dtype", dtype)?;
@@ -253,7 +253,7 @@ fn empty(py: Python<'_>, shape: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, PyAn
 fn full(py: Python<'_>, shape: &Bound<'_, PyAny>, fill_value: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, PyAny>>, order: Option<&Bound<'_, PyAny>>, device: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
     check_device(device)?;
     let _ = order;
-    let too_many_dims = shape.len().map_or(false, |n| n > MAX_NDIM);
+    let too_many_dims = !shape.is_instance_of::<pyo3::types::PyInt>() && shape.len().map_or(false, |n| n > MAX_NDIM);
     let no_dtype = dtype.map_or(true, |d| d.is_none());
     if !too_many_dims && !called_from_dunder_array(py) {
         let dims = extract_shape(shape)?;
@@ -546,17 +546,11 @@ macro_rules! binary_functions {
     ($( $name:ident => ($dunder:literal, $rdunder:literal) ),* $(,)?) => {
         $(
             fn $name<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Py<PyAny>> {
-                let r = if x1.is_instance_of::<PyArray>() {
-                    x1.call_method1($dunder, (x2,))?
-                } else if x2.is_instance_of::<PyArray>() {
-                    x2.call_method1($rdunder, (x1,))?
-                } else {
-                    return fallback(py, "call", (numpy_name(stringify!($name)), x1.clone(), x2.clone()), None);
-                };
-                if r.is(&pyo3::types::PyNotImplemented::get(py)) {
-                    return fallback(py, "call", (numpy_name(stringify!($name)), x1.clone(), x2.clone()), None);
+                let name = numpy_name(stringify!($name));
+                match crate::python::operator_function(name, x1, x2)? {
+                    Some(result) => Ok(result),
+                    None => fallback(py, "call", (name, x1.clone(), x2.clone()), None),
                 }
-                Ok(r.unbind())
             }
         )*
         fn register_binary(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -588,6 +582,11 @@ macro_rules! method_functions {
             #[pyfunction]
             #[pyo3(name = $py_name, signature = (a, *args, **kwargs), text_signature = $sig)]
             fn $name<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+                if let Ok(arr) = a.cast_exact::<PyArray>() {
+                    if let Some(result) = crate::python::call_native_method(arr, $py_name, args, kwargs) {
+                        return result;
+                    }
+                }
                 if a.is_instance_of::<PyArray>() {
                     return a.call_method($py_name, args.clone(), kwargs).map(|r| r.unbind());
                 }
@@ -613,6 +612,11 @@ macro_rules! bool_reductions {
             #[pyfunction]
             #[pyo3(name = $py_name, signature = (a, *args, **kwargs), text_signature = "(a, axis=None, out=None, keepdims=False, *, where=True)")]
             fn $name<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+                if let Ok(arr) = a.cast_exact::<PyArray>() {
+                    if let Some(result) = crate::python::call_native_method(arr, $py_name, args, kwargs) {
+                        return result;
+                    }
+                }
                 if a.is_instance_of::<PyArray>() {
                     return a.call_method($py_name, args.clone(), kwargs).map(|r| r.unbind());
                 }
