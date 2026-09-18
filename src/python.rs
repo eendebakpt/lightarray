@@ -5,8 +5,7 @@
 //! through the helpers in `lightarray/_fallback.py`, with float64 results
 //! wrapped back into `PyArray`.
 
-use crate::array::{Array, ArrayError, Selector};
-use crate::dims::ITEMSIZE;
+use crate::array::{compare, compare_scalar, AnyArray, Array, ArrayError, Scalar, Selector};
 use pyo3::buffer::{PyBuffer, PyUntypedBuffer};
 use pyo3::call::PyCallArgs;
 use pyo3::exceptions::{PyBufferError, PyIndexError, PyTypeError, PyValueError};
@@ -14,7 +13,7 @@ use pyo3::ffi;
 use pyo3::basic::CompareOp;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyFloat, PyInt, PyList, PyMemoryView, PyNotImplemented, PySlice, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyMemoryView, PyNotImplemented, PySlice, PyTuple};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
@@ -42,7 +41,7 @@ impl From<ArrayError> for PyErr {
 /// buffer protocol and DLPack stay valid for the object's lifetime.
 #[pyclass(name = "ndarray", module = "lightarray", frozen, subclass)]
 pub struct PyArray {
-    inner: std::cell::UnsafeCell<Array>,
+    inner: std::cell::UnsafeCell<AnyArray>,
 }
 
 // SAFETY: see the type docs; mutation is confined to GIL-holding methods and
@@ -58,13 +57,18 @@ const _: () = {
 };
 
 impl PyArray {
+    /// A float64 array (the fast path and by far the most common result).
     pub fn new(inner: Array) -> PyArray {
+        PyArray::from_any(AnyArray::F64(inner))
+    }
+
+    pub fn from_any(inner: AnyArray) -> PyArray {
         PyArray { inner: std::cell::UnsafeCell::new(inner) }
     }
 
-    /// Shared access to the array.
+    /// Shared access to the array, whatever its dtype.
     #[inline]
-    pub fn inner(&self) -> &Array {
+    pub fn arr(&self) -> &AnyArray {
         // SAFETY: readers and the GIL-serialised writers never overlap on the
         // GIL build; see the type docs for the free-threaded contract.
         unsafe { &*self.inner.get() }
@@ -74,68 +78,105 @@ impl PyArray {
     /// change the shape or reallocate the data (views point at it).
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    pub fn inner_mut(&self) -> &mut Array {
+    pub fn arr_mut(&self) -> &mut AnyArray {
         // SAFETY: as above; only element values are written.
         unsafe { &mut *self.inner.get() }
+    }
+
+    /// The float64 array, or None for int64/bool arrays. Every float64
+    /// kernel goes through this, so no kernel can see another dtype.
+    #[inline]
+    pub fn f64(&self) -> Option<&Array<f64>> {
+        self.arr().as_f64()
+    }
+
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn f64_mut(&self) -> Option<&mut Array<f64>> {
+        self.arr_mut().as_f64_mut()
     }
 
     pub fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(Py::new(py, self)?.into_any())
     }
 
-    /// Copy any object exposing a float64 buffer (NumPy arrays, memoryviews,
-    /// `array.array('d')`) into a new `Array`. 0-d buffers carry a NULL
-    /// shape that PyBuffer rejects, so they are read separately: with
-    /// `coerce_scalars` any numeric 0-d object (NumPy integer or bool
-    /// scalars included) becomes a float64 scalar; without it only exact
-    /// float64 0-d buffers qualify, so complex or integer results keep
-    /// their NumPy dtype.
-    pub fn from_f64_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, coerce_scalars: bool) -> PyResult<Option<Array>> {
-        let buf = match PyBuffer::<f64>::get(obj) {
-            Ok(b) => b,
-            Err(_) => {
-                let is_0d = obj.getattr("ndim").and_then(|n| n.extract::<usize>()).map_or(false, |n| n == 0);
-                if !is_0d {
-                    return Ok(None);
-                }
-                if coerce_scalars {
-                    return Ok(obj.extract::<f64>().ok().map(Array::scalar));
-                }
-                // PyBuffer rejects 0-d buffers (NULL shape), so ask the dtype.
-                let is_f64 = obj
-                    .getattr("dtype")
-                    .and_then(|d| d.getattr("num"))
-                    .and_then(|n| n.extract::<i32>())
-                    .map_or(false, |n| n == 12);
-                return Ok(if is_f64 { Some(Array::scalar(obj.extract()?)) } else { None });
-            }
-        };
-        if buf.dimensions() > crate::dims::MAX_NDIM {
+    /// Copy an object exposing a float64, int64 or bool buffer (NumPy arrays,
+    /// memoryviews, `array.array`) into a new array of the same dtype; None
+    /// for anything else. 0-d buffers carry a NULL shape that PyBuffer
+    /// rejects, so they are read through the object's dtype instead.
+    pub fn from_buffer_any(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Option<AnyArray>> {
+        let ndim = obj.getattr("ndim").and_then(|n| n.extract::<usize>()).ok();
+        if ndim == Some(0) {
+            let Ok(dtype) = obj.getattr("dtype") else { return Ok(None) };
+            let kind: String = dtype.getattr("kind")?.extract()?;
+            let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
+            return Ok(match (kind.as_str(), itemsize) {
+                ("f", 8) => Some(AnyArray::F64(Array::scalar(obj.extract::<f64>()?))),
+                ("i", 8) => Some(AnyArray::I64(Array::scalar(obj.call_method0("__int__")?.extract::<i64>()?))),
+                ("b", 1) => Some(AnyArray::Bool(Array::scalar(obj.is_truthy()?))),
+                _ => None,
+            });
+        }
+        if ndim.map_or(false, |n| n > crate::dims::MAX_NDIM) {
             return Ok(None); // stays a NumPy array
         }
-        let shape: Vec<usize> = buf.shape().to_vec();
-        let data = buf.to_vec(py)?;
-        Ok(Some(Array::new(data, &shape)?))
+        if let Ok(buf) = PyBuffer::<f64>::get(obj) {
+            let shape: Vec<usize> = buf.shape().to_vec();
+            return Ok(Some(AnyArray::F64(Array::new(buf.to_vec(py)?, &shape)?)));
+        }
+        if let Ok(buf) = PyBuffer::<i64>::get(obj) {
+            let shape: Vec<usize> = buf.shape().to_vec();
+            return Ok(Some(AnyArray::I64(Array::new(buf.to_vec(py)?, &shape)?)));
+        }
+        if let Some((mask, shape)) = numpy_bool_buffer(obj) {
+            return Ok(Some(AnyArray::Bool(Array::new(mask, &shape)?)));
+        }
+        Ok(None)
     }
 
-    /// Convert a NumPy result back into lightarray where possible.
+    /// float64 view of things: copy a buffer as float64, coercing NumPy
+    /// scalars of any numeric kind when `coerce_scalars` is set.
+    pub fn from_f64_buffer(py: Python<'_>, obj: &Bound<'_, PyAny>, coerce_scalars: bool) -> PyResult<Option<Array>> {
+        match PyArray::from_buffer_any(py, obj)? {
+            Some(AnyArray::F64(a)) => Ok(Some(a)),
+            Some(other) if coerce_scalars => Ok(Some(other.to_f64())),
+            Some(_) => Ok(None),
+            None => {
+                let is_0d = obj.getattr("ndim").and_then(|n| n.extract::<usize>()).map_or(false, |n| n == 0);
+                if is_0d && coerce_scalars {
+                    return Ok(obj.extract::<f64>().ok().map(Array::scalar));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Convert a NumPy result back into lightarray where possible
+    /// (float64, int64 and bool arrays of at most MAX_NDIM dimensions).
     pub fn wrap_result(py: Python<'_>, obj: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         if obj.is_instance_of::<PyArray>() {
             return Ok(obj.unbind());
         }
         if obj.hasattr("__array_interface__")? {
-            let ndim = obj.getattr("ndim").and_then(|n| n.extract::<usize>()).unwrap_or(0);
-            if ndim <= crate::dims::MAX_NDIM {
-                if let Some(arr) = PyArray::from_f64_buffer(py, &obj, false)? {
-                    return PyArray::new(arr).into_py(py);
-                }
+            if let Some(arr) = PyArray::from_buffer_any(py, &obj)? {
+                return PyArray::from_any(arr).into_py(py);
             }
         }
         Ok(obj.unbind())
     }
 }
 
-// ---- helpers ------------------------------------------------------------
+/// The float64 array behind a Python object, if it is a float64 lightarray.
+#[inline]
+pub fn f64_of<'a>(obj: &'a Bound<'_, PyAny>) -> Option<&'a Array<f64>> {
+    obj.cast::<PyArray>().ok().and_then(|a| a.get().f64())
+}
+
+/// Any lightarray array behind a Python object.
+#[inline]
+pub fn any_of<'a>(obj: &'a Bound<'_, PyAny>) -> Option<&'a AnyArray> {
+    obj.cast::<PyArray>().ok().map(|a| a.get().arr())
+}
 
 static NP_FLOAT64: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static NP_INTP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -143,6 +184,12 @@ static NP_BOOL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// A `numpy.intp` scalar (what `argmax` returns in NumPy).
 pub fn np_int(py: Python<'_>, v: usize) -> PyResult<Py<PyAny>> {
+    let ty = NP_INTP.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("intp")?.unbind()) })?;
+    Ok(ty.bind(py).call1((v,))?.unbind())
+}
+
+/// A `numpy.int64` scalar (integer reductions and integer indexing).
+pub fn np_i64(py: Python<'_>, v: i64) -> PyResult<Py<PyAny>> {
     let ty = NP_INTP.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("intp")?.unbind()) })?;
     Ok(ty.bind(py).call1((v,))?.unbind())
 }
@@ -165,27 +212,61 @@ fn not_implemented(py: Python<'_>) -> Py<PyAny> {
     PyNotImplemented::get(py).to_owned().into_any().unbind()
 }
 
-/// Classify a binary-operator operand: our own array, a scalar, or something
-/// for NumPy (or the other operand's reflected method) to handle.
-enum Operand<'a, 'py> {
-    Array(&'a Bound<'py, PyArray>),
-    Scalar(f64),
+/// Classify a binary-operator operand: a float64 lightarray (the fast path),
+/// a lightarray of another dtype, a Python or NumPy scalar, or something for
+/// NumPy (or the other operand's reflected method) to handle.
+pub enum Operand<'a> {
+    F64(&'a Array<f64>),
+    Alt(&'a AnyArray),
+    Float(f64),
+    Int(i64),
+    Bool(bool),
     Other,
 }
 
-fn classify<'a, 'py>(obj: &'a Bound<'py, PyAny>) -> Operand<'a, 'py> {
-    if let Ok(a) = obj.cast::<PyArray>() {
-        return Operand::Array(a);
-    }
-    if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyInt>() {
-        if let Ok(v) = obj.extract::<f64>() {
-            return Operand::Scalar(v);
+impl Operand<'_> {
+    /// The operand as a float64 scalar, if it is a scalar at all.
+    #[inline]
+    pub fn scalar(&self) -> Option<f64> {
+        match *self {
+            Operand::Float(v) => Some(v),
+            Operand::Int(v) => Some(v as f64),
+            Operand::Bool(v) => Some(v as u8 as f64),
+            _ => None,
         }
+    }
+}
+
+pub fn classify<'a>(obj: &'a Bound<'_, PyAny>) -> Operand<'a> {
+    if let Ok(a) = obj.cast::<PyArray>() {
+        return match a.get().arr() {
+            AnyArray::F64(f) => Operand::F64(f),
+            other => Operand::Alt(other),
+        };
+    }
+    if obj.is_instance_of::<PyFloat>() {
+        if let Ok(v) = obj.extract::<f64>() {
+            return Operand::Float(v);
+        }
+    }
+    if obj.is_instance_of::<PyBool>() {
+        return Operand::Bool(obj.is_truthy().unwrap_or(false));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        return match obj.extract::<i64>() {
+            Ok(v) => Operand::Int(v),
+            Err(_) => obj.extract::<f64>().map_or(Operand::Other, Operand::Float),
+        };
     }
     // NumPy scalars and other numbers; arrays expose __len__ and go to NumPy.
     if !obj.hasattr("__len__").unwrap_or(true) {
+        if obj.hasattr("__index__").unwrap_or(false) {
+            if let Ok(v) = obj.extract::<i64>() {
+                return Operand::Int(v);
+            }
+        }
         if let Ok(v) = obj.extract::<f64>() {
-            return Operand::Scalar(v);
+            return Operand::Float(v);
         }
     }
     Operand::Other
@@ -203,8 +284,10 @@ fn numpy_handles(obj: &Bound<'_, PyAny>) -> bool {
 }
 
 /// Apply `f` element-wise for `self OP other`, or `other OP self` when
-/// `reflected` is set. NumPy arrays and other array-likes go through the
-/// NumPy ufunc `name` and come back as lightarray when float64.
+/// `reflected` is set. float64 operands run natively; int64 and bool
+/// arrays promote to float64 when a float is involved and have native
+/// integer add/subtract/multiply; NumPy arrays and other array-likes go
+/// through the NumPy ufunc `name`.
 #[inline]
 fn binary_op<F: Fn(f64, f64) -> f64>(
     slf: &Bound<'_, PyArray>,
@@ -214,33 +297,119 @@ fn binary_op<F: Fn(f64, f64) -> f64>(
     f: F,
 ) -> PyResult<Py<PyAny>> {
     let py = slf.py();
-    let a = slf.get().inner();
-    let result = match classify(other) {
-        Operand::Array(b) => {
-            let b = b.get().inner();
+    let operand = classify(other);
+    let AnyArray::F64(a) = slf.get().arr() else {
+        return alt_binary(slf, other, operand, reflected, name, f);
+    };
+    let result = match operand {
+        Operand::F64(b) => {
             if reflected {
                 b.zip_map(a, &f)?
             } else {
                 a.zip_map(b, &f)?
             }
         }
-        Operand::Scalar(s) => {
+        Operand::Alt(b) => {
+            let b = b.to_f64();
+            if reflected {
+                b.zip_map(a, &f)?
+            } else {
+                a.zip_map(&b, &f)?
+            }
+        }
+        Operand::Other if numpy_handles(other) => return numpy_binary(py, slf, other, reflected, name),
+        Operand::Other => return Ok(not_implemented(py)),
+        scalar => {
+            let s = scalar.scalar().expect("remaining variants are scalars");
             if reflected {
                 a.map(|x| f(s, x))
             } else {
                 a.map(|x| f(x, s))
             }
         }
-        Operand::Other if numpy_handles(other) => {
-            return if reflected {
-                fallback(py, "call", (name, other.clone(), slf.clone()), None)
-            } else {
-                fallback(py, "call", (name, slf.clone(), other.clone()), None)
-            };
-        }
-        Operand::Other => return Ok(not_implemented(py)),
     };
     PyArray::new(result).into_py(py)
+}
+
+fn numpy_binary(py: Python<'_>, slf: &Bound<'_, PyArray>, other: &Bound<'_, PyAny>, reflected: bool, name: &str) -> PyResult<Py<PyAny>> {
+    if reflected {
+        fallback(py, "call", (name, other.clone(), slf.clone()), None)
+    } else {
+        fallback(py, "call", (name, slf.clone(), other.clone()), None)
+    }
+}
+
+/// Binary operation whose left operand is an int64 or bool array.
+#[inline(never)]
+fn alt_binary<F: Fn(f64, f64) -> f64>(
+    slf: &Bound<'_, PyArray>,
+    other: &Bound<'_, PyAny>,
+    operand: Operand<'_>,
+    reflected: bool,
+    name: &str,
+    f: F,
+) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    let me = slf.get().arr();
+    if matches!(operand, Operand::Other) {
+        return if numpy_handles(other) { numpy_binary(py, slf, other, reflected, name) } else { Ok(not_implemented(py)) };
+    }
+    // A float on the other side, or true division: the result is float64.
+    if name == "divide" || matches!(operand, Operand::Float(_) | Operand::F64(_)) {
+        let a = me.to_f64();
+        let result = match operand {
+            Operand::F64(b) => {
+                if reflected {
+                    b.zip_map(&a, &f)?
+                } else {
+                    a.zip_map(b, &f)?
+                }
+            }
+            Operand::Alt(b) => {
+                let b = b.to_f64();
+                if reflected {
+                    b.zip_map(&a, &f)?
+                } else {
+                    a.zip_map(&b, &f)?
+                }
+            }
+            scalar => {
+                let s = scalar.scalar().expect("remaining variants are scalars");
+                if reflected {
+                    a.map(|x| f(s, x))
+                } else {
+                    a.map(|x| f(x, s))
+                }
+            }
+        };
+        return PyArray::new(result).into_py(py);
+    }
+    // Integer arithmetic that cannot fail (wrapping, like NumPy's int64).
+    let int_op: Option<fn(i64, i64) -> i64> = match name {
+        "add" => Some(i64::wrapping_add),
+        "subtract" => Some(i64::wrapping_sub),
+        "multiply" => Some(i64::wrapping_mul),
+        _ => None,
+    };
+    if let (Some(op), AnyArray::I64(a)) = (int_op, me) {
+        let result = match operand {
+            Operand::Int(i) => Some(a.map_int(|x| if reflected { op(i, x) } else { op(x, i) })),
+            Operand::Alt(AnyArray::I64(b)) => {
+                if reflected {
+                    b.zip_int(a, op)
+                } else {
+                    a.zip_int(b, op)
+                }
+            }
+            _ => None,
+        };
+        if let Some(r) = result {
+            return PyArray::from_any(AnyArray::I64(r)).into_py(py);
+        }
+    }
+    // Everything else (bool arithmetic, integer division and powers,
+    // broadcasting between int arrays) follows NumPy exactly.
+    numpy_binary(py, slf, other, reflected, name)
 }
 
 /// Round half to even (NumPy's `rint`/`round`).
@@ -259,30 +428,31 @@ pub fn binary_native(
     f: fn(f64, f64) -> f64,
 ) -> PyResult<Py<PyAny>> {
     let result = match (classify(x1), classify(x2)) {
-        (Operand::Array(a), Operand::Array(b)) => a.get().inner().zip_map(b.get().inner(), f)?,
-        (Operand::Array(a), Operand::Scalar(s)) => a.get().inner().map(|x| f(x, s)),
-        (Operand::Scalar(s), Operand::Array(b)) => b.get().inner().map(|x| f(s, x)),
-        (Operand::Scalar(a), Operand::Scalar(b)) => return Ok(f(a, b).into_pyobject(py)?.into_any().unbind()),
+        (Operand::F64(a), Operand::F64(b)) => a.zip_map(b, f)?,
+        (Operand::F64(a), Operand::Float(s)) => a.map(|x| f(x, s)),
+        (Operand::Float(s), Operand::F64(b)) => b.map(|x| f(s, x)),
+        (Operand::F64(a), Operand::Int(s)) => a.map(|x| f(x, s as f64)),
+        (Operand::Int(s), Operand::F64(b)) => b.map(|x| f(s as f64, x)),
+        (Operand::Float(a), Operand::Float(b)) => return Ok(f(a, b).into_pyobject(py)?.into_any().unbind()),
         _ => return fallback(py, "call", (name, x1.clone(), x2.clone()), None),
     };
     PyArray::new(result).into_py(py)
 }
 
-/// Build a writable NumPy bool array of `shape` from 0/1 bytes.
-pub fn bool_array(py: Python<'_>, bytes: Vec<u8>, shape: &[usize]) -> PyResult<Py<PyAny>> {
-    let np = py.import("numpy")?;
-    let buffer = pyo3::types::PyByteArray::new(py, &bytes);
-    let flat = np.getattr("frombuffer")?.call1((buffer, "?"))?;
-    if shape.len() == 1 {
-        return Ok(flat.unbind());
-    }
-    Ok(flat.call_method1("reshape", (PyTuple::new(py, shape)?,))?.unbind())
-}
+
 
 /// Read a contiguous NumPy bool array (format '?') as a Vec<bool> plus its
 /// shape. bool is not a PyBuffer element type in PyO3, so this goes through
 /// the untyped buffer. Non-buffers and other formats give None.
 pub fn bool_mask(obj: &Bound<'_, PyAny>) -> Option<(Vec<bool>, Vec<usize>)> {
+    if let Some(any) = any_of(obj) {
+        return any.as_bool().map(|m| (m.data().to_vec(), m.shape().to_vec()));
+    }
+    numpy_bool_buffer(obj)
+}
+
+/// Read a contiguous NumPy bool buffer (format '?').
+fn numpy_bool_buffer(obj: &Bound<'_, PyAny>) -> Option<(Vec<bool>, Vec<usize>)> {
     // SAFETY: `obj` is a valid object pointer for the duration of the call.
     if unsafe { ffi::PyObject_CheckBuffer(obj.as_ptr()) } != 1 {
         return None;
@@ -302,14 +472,19 @@ pub fn bool_mask(obj: &Bound<'_, PyAny>) -> Option<(Vec<bool>, Vec<usize>)> {
 pub fn where_native(py: Python<'_>, cond: &Bound<'_, PyAny>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let native = || -> PyResult<Option<Array>> {
         let Some((mask, shape)) = bool_mask(cond) else { return Ok(None) };
-        let as_array = |v: &Bound<'_, PyAny>| -> PyResult<Option<Array>> {
-            Ok(match classify(v) {
-                Operand::Array(a) if a.get().inner().shape() == shape.as_slice() => Some(a.get().inner().clone()),
-                Operand::Scalar(s) => Some(Array::filled(&shape, s)?),
+        let (ox, oy) = (classify(x), classify(y));
+        // two integer scalars give an integer result in NumPy
+        if !matches!(ox, Operand::F64(_) | Operand::Float(_)) && !matches!(oy, Operand::F64(_) | Operand::Float(_)) {
+            return Ok(None);
+        }
+        let as_array = |o: &Operand<'_>| -> PyResult<Option<Array>> {
+            Ok(match o {
+                Operand::F64(a) if a.shape() == shape.as_slice() => Some((*a).clone()),
+                Operand::Float(_) | Operand::Int(_) => Some(Array::filled(&shape, o.scalar().expect("scalar"))?),
                 _ => None,
             })
         };
-        let (Some(xa), Some(ya)) = (as_array(x)?, as_array(y)?) else { return Ok(None) };
+        let (Some(xa), Some(ya)) = (as_array(&ox)?, as_array(&oy)?) else { return Ok(None) };
         Ok(Some(Array::select_where(&mask, &xa, &ya)?))
     };
     match native()? {
@@ -325,7 +500,11 @@ fn float_floor_div(a: f64, b: f64) -> f64 {
 /// Python/NumPy remainder: result has the sign of the divisor.
 fn float_mod(a: f64, b: f64) -> f64 {
     let r = a % b;
-    if r != 0.0 && ((r < 0.0) != (b < 0.0)) {
+    if r == 0.0 {
+        // a zero remainder takes the sign of the divisor (IEEE/Array API)
+        return if b.is_nan() { r } else { 0.0f64.copysign(b) };
+    }
+    if (r < 0.0) != (b < 0.0) {
         r + b
     } else {
         r
@@ -392,11 +571,37 @@ fn reduce<'py>(
     along_axis: impl FnOnce(&Array, isize) -> PyResult<Array>,
 ) -> PyResult<Py<PyAny>> {
     let py = slf.py();
+    let Some(a) = slf.get().f64() else {
+        return alt_reduce(slf, name, args, kwargs);
+    };
     match parse_axis(args, kwargs)? {
-        Axis::None => np_float(py, native(slf.get().inner())?),
-        Axis::Int(axis) => PyArray::new(along_axis(slf.get().inner(), axis)?).into_py(py),
+        Axis::None => np_float(py, native(a)?),
+        Axis::Int(axis) => PyArray::new(along_axis(a, axis)?).into_py(py),
         Axis::Other => call_method_fallback(slf, name, args, kwargs),
     }
+}
+
+/// Reductions of int64 and bool arrays: the whole-array sum, extrema and
+/// mean natively, everything else through NumPy.
+#[inline(never)]
+fn alt_reduce<'py>(
+    slf: &Bound<'py, PyArray>,
+    name: &str,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    if matches!(parse_axis(args, kwargs)?, Axis::None) {
+        match (slf.get().arr(), name) {
+            (AnyArray::I64(a), "sum") => return np_i64(py, a.sum()),
+            (AnyArray::Bool(a), "sum") => return np_i64(py, a.count() as i64),
+            (AnyArray::I64(a), "max") => return np_i64(py, a.max().ok_or_else(|| no_identity("maximum"))?),
+            (AnyArray::I64(a), "min") => return np_i64(py, a.min().ok_or_else(|| no_identity("minimum"))?),
+            (any, "mean") if any.size() > 0 => return np_float(py, any.to_f64().mean()),
+            _ => {}
+        }
+    }
+    call_method_fallback(slf, name, args, kwargs)
 }
 
 /// Is the call bare, or only `order` in {C, A, K} (positional or keyword),
@@ -424,8 +629,16 @@ fn bare_or_fallback<'py>(
     kwargs: Option<&Bound<'py, PyDict>>,
     native: impl FnOnce(&Array) -> PyResult<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
-    if args.is_empty() && kwargs.map_or(true, |k| k.is_empty()) {
-        return native(slf.get().inner());
+    let bare = args.is_empty() && kwargs.map_or(true, |k| k.is_empty());
+    if bare {
+        match (slf.get().arr(), name) {
+            (AnyArray::F64(a), _) => return native(a),
+            (AnyArray::Bool(a), "any") => return np_bool(slf.py(), a.data().iter().any(|&b| b)),
+            (AnyArray::Bool(a), "all") => return np_bool(slf.py(), a.data().iter().all(|&b| b)),
+            (AnyArray::I64(a), "any") => return np_bool(slf.py(), a.data().iter().any(|&v| v != 0)),
+            (AnyArray::I64(a), "all") => return np_bool(slf.py(), a.data().iter().all(|&v| v != 0)),
+            _ => {}
+        }
     }
     call_method_fallback(slf, name, args, kwargs)
 }
@@ -477,34 +690,37 @@ impl PyArray {
         order: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let _ = order;
-        let float64 = match dtype {
-            None => true,
-            Some(d) if d.is_none() => true,
-            Some(d) => {
-                let np = py.import("numpy")?;
-                np.getattr("dtype")?.call1((d,))?.getattr("num")?.extract::<i32>()? == 12
+        let (kind, itemsize) = match dtype {
+            Some(d) if !d.is_none() => {
+                let dt = py.import("numpy")?.getattr("dtype")?.call1((d,))?;
+                (dt.getattr("kind")?.extract::<String>()?, dt.getattr("itemsize")?.extract::<usize>()?)
             }
+            _ => ("f".to_string(), 8),
         };
-        if !float64 || strides.map_or(false, |s| !s.is_none()) {
-            return Err(PyTypeError::new_err(
-                "lightarray.ndarray holds contiguous float64 data only; use numpy.ndarray for other dtypes or strides",
-            ));
+        let unsupported = || {
+            PyTypeError::new_err("lightarray.ndarray holds contiguous float64, int64 or bool data; use numpy.ndarray for other dtypes or strides")
+        };
+        if strides.map_or(false, |s| !s.is_none()) {
+            return Err(unsupported());
         }
         let shape = extract_shape(shape)?;
-        match buffer {
-            None => Ok(PyArray::new(Array::filled(&shape, 0.0)?)),
-            Some(buf) => {
+        match (kind.as_str(), itemsize, buffer) {
+            ("f", 8, None) => Ok(PyArray::new(Array::filled(&shape, 0.0)?)),
+            ("i", 8, None) => Ok(PyArray::from_any(AnyArray::I64(Array::filled(&shape, 0i64)?))),
+            ("b", 1, None) => Ok(PyArray::from_any(AnyArray::Bool(Array::filled(&shape, false)?))),
+            ("f", 8, Some(buf)) => {
                 let np = py.import("numpy")?;
                 let kw = PyDict::new(py);
                 kw.set_item("dtype", "float64")?;
                 kw.set_item("offset", offset)?;
                 let flat = np.getattr("frombuffer")?.call((buf,), Some(&kw))?;
                 let n: usize = shape.iter().product();
-                let taken = flat.get_item(pyo3::types::PySlice::new(py, 0, n as isize, 1))?;
+                let taken = flat.get_item(PySlice::new(py, 0, n as isize, 1))?;
                 let arr = PyArray::from_f64_buffer(py, &taken, true)?
                     .ok_or_else(|| PyTypeError::new_err("buffer must expose float64 data"))?;
                 Ok(PyArray::new(arr.reshape(&shape)?))
             }
+            _ => Err(unsupported()),
         }
     }
 
@@ -512,32 +728,32 @@ impl PyArray {
 
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.inner().shape())
+        PyTuple::new(py, self.arr().shape())
     }
 
     #[getter]
     fn strides<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.inner().dims.strides())
+        PyTuple::new(py, self.arr().dims().strides())
     }
 
     #[getter]
     fn ndim(&self) -> usize {
-        self.inner().ndim()
+        self.arr().ndim()
     }
 
     #[getter]
     fn size(&self) -> usize {
-        self.inner().size()
+        self.arr().size()
     }
 
     #[getter]
     fn itemsize(&self) -> usize {
-        ITEMSIZE as usize
+        self.arr().itemsize()
     }
 
     #[getter]
     fn nbytes(&self) -> usize {
-        self.inner().size() * ITEMSIZE as usize
+        self.arr().size() * self.arr().itemsize()
     }
 
     /// Makes NumPy arrays and scalars defer to our reflected operators, so
@@ -550,7 +766,7 @@ impl PyArray {
 
     #[getter]
     fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        py.import("numpy")?.getattr("dtype")?.call1(("float64",))
+        py.import("numpy")?.getattr("dtype")?.call1((self.arr().dtype_name(),))
     }
 
     // ---- conversions ----
@@ -566,30 +782,37 @@ impl PyArray {
     }
 
     fn __len__(&self) -> PyResult<usize> {
-        match self.inner().shape().first() {
+        match self.arr().shape().first() {
             Some(&n) => Ok(n),
             None => Err(PyTypeError::new_err("len() of unsized object")),
         }
     }
 
     fn __bool__(&self) -> PyResult<bool> {
-        match self.inner().size() {
-            1 => Ok(self.inner().data()[0] != 0.0),
-            _ => Err(PyValueError::new_err(
+        match self.arr().item() {
+            Some(Scalar::F(v)) => Ok(v != 0.0),
+            Some(Scalar::I(v)) => Ok(v != 0),
+            Some(Scalar::B(v)) => Ok(v),
+            None => Err(PyValueError::new_err(
                 "The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()",
             )),
         }
     }
 
     fn __float__(&self) -> PyResult<f64> {
-        match self.inner().size() {
-            1 => Ok(self.inner().data()[0]),
-            _ => Err(PyTypeError::new_err("only length-1 arrays can be converted to Python scalars")),
+        match self.arr().item() {
+            Some(v) => Ok(v.as_f64()),
+            None => Err(PyTypeError::new_err("only length-1 arrays can be converted to Python scalars")),
         }
     }
 
     fn __int__(&self) -> PyResult<i64> {
-        Ok(self.__float__()? as i64)
+        match self.arr().item() {
+            Some(Scalar::F(v)) => Ok(v as i64),
+            Some(Scalar::I(v)) => Ok(v),
+            Some(Scalar::B(v)) => Ok(v as i64),
+            None => Err(PyTypeError::new_err("only length-1 arrays can be converted to Python scalars")),
+        }
     }
 
     /// NumPy's `__array__` protocol. NumPy normally takes the zero-copy
@@ -623,18 +846,19 @@ impl PyArray {
         if view.is_null() {
             return Err(PyBufferError::new_err("view is null"));
         }
-        let arr = slf.get().inner();
+        let arr = slf.get().arr();
         let ndim = arr.ndim();
+        let itemsize = arr.itemsize();
         // SAFETY: `view` is a valid Py_buffer; the pointers we store refer to
         // memory owned by `slf`, which `view.obj` keeps alive.
         unsafe {
             (*view).obj = slf.clone().into_any().into_ptr();
-            (*view).buf = arr.data().as_ptr() as *mut c_void;
-            (*view).len = (arr.size() * ITEMSIZE as usize) as isize;
+            (*view).buf = arr.data_ptr() as *mut c_void;
+            (*view).len = (arr.size() * itemsize) as isize;
             (*view).readonly = 0;
-            (*view).itemsize = ITEMSIZE;
+            (*view).itemsize = itemsize as isize;
             (*view).format = if (flags & ffi::PyBUF_FORMAT) == ffi::PyBUF_FORMAT {
-                c"d".as_ptr() as *mut _
+                arr.format().as_ptr() as *mut _
             } else {
                 ptr::null_mut()
             };
@@ -643,12 +867,12 @@ impl PyArray {
             let nd_requested = (flags & ffi::PyBUF_ND) == ffi::PyBUF_ND;
             (*view).ndim = if nd_requested { ndim as c_int } else { 1 };
             (*view).shape = if ndim > 0 && nd_requested {
-                arr.dims.shape_ptr() as *mut ffi::Py_ssize_t
+                arr.dims().shape_ptr() as *mut ffi::Py_ssize_t
             } else {
                 ptr::null_mut()
             };
             (*view).strides = if ndim > 0 && (flags & ffi::PyBUF_STRIDES) == ffi::PyBUF_STRIDES {
-                arr.dims.strides_ptr() as *mut ffi::Py_ssize_t
+                arr.dims().strides_ptr() as *mut ffi::Py_ssize_t
             } else {
                 ptr::null_mut()
             };
@@ -725,34 +949,55 @@ impl PyArray {
     /// through NumPy.
     fn __richcmp__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let a = slf.get().inner();
-        let cmp: fn(f64, f64) -> bool = match op {
-            CompareOp::Lt => |x, y| x < y,
-            CompareOp::Le => |x, y| x <= y,
-            CompareOp::Eq => |x, y| x == y,
-            CompareOp::Ne => |x, y| x != y,
-            CompareOp::Gt => |x, y| x > y,
-            CompareOp::Ge => |x, y| x >= y,
-        };
-        let bytes: Vec<u8> = match classify(other) {
-            Operand::Array(b) if b.get().inner().dims == a.dims => {
-                a.data().iter().zip(b.get().inner().data()).map(|(&x, &y)| cmp(x, y) as u8).collect()
+        macro_rules! cmp_fn {
+            ($t:ty) => {
+                match op {
+                    CompareOp::Lt => (|x: $t, y: $t| x < y) as fn($t, $t) -> bool,
+                    CompareOp::Le => |x: $t, y: $t| x <= y,
+                    CompareOp::Eq => |x: $t, y: $t| x == y,
+                    CompareOp::Ne => |x: $t, y: $t| x != y,
+                    CompareOp::Gt => |x: $t, y: $t| x > y,
+                    CompareOp::Ge => |x: $t, y: $t| x >= y,
+                }
+            };
+        }
+        let (fc, ic, bc) = (cmp_fn!(f64), cmp_fn!(i64), cmp_fn!(bool));
+        let me = slf.get().arr();
+        let operand = classify(other);
+        let equality = matches!(op, CompareOp::Eq | CompareOp::Ne);
+        let mask: Option<Array<bool>> = match (me, &operand) {
+            (AnyArray::F64(a), Operand::F64(b)) => compare(a, b, fc),
+            (AnyArray::F64(a), Operand::Alt(AnyArray::I64(_))) => {
+                let Operand::Alt(b) = &operand else { unreachable!() };
+                compare(a, &b.to_f64(), fc)
             }
-            Operand::Scalar(s) => a.data().iter().map(|&x| cmp(x, s) as u8).collect(),
-            Operand::Array(_) | Operand::Other if numpy_handles(other) => {
-                let name = match op {
-                    CompareOp::Lt => "less",
-                    CompareOp::Le => "less_equal",
-                    CompareOp::Eq => "equal",
-                    CompareOp::Ne => "not_equal",
-                    CompareOp::Gt => "greater",
-                    CompareOp::Ge => "greater_equal",
-                };
-                return fallback(py, "call", (name, slf.clone(), other.clone()), None);
+            (AnyArray::F64(a), Operand::Float(_) | Operand::Int(_) | Operand::Bool(_)) => {
+                let s = operand.scalar().expect("scalar");
+                Some(compare_scalar(a, |x| fc(x, s)))
             }
-            _ => return Ok(not_implemented(py)),
+            (AnyArray::I64(a), Operand::Int(i)) => Some(compare_scalar(a, |x| ic(x, *i))),
+            (AnyArray::I64(a), Operand::Alt(AnyArray::I64(b))) => compare(a, b, ic),
+            (AnyArray::I64(_), Operand::Float(s)) => Some(compare_scalar(&me.to_f64(), |x| fc(x, *s))),
+            (AnyArray::I64(_), Operand::F64(b)) => compare(&me.to_f64(), b, fc),
+            (AnyArray::Bool(a), Operand::Alt(AnyArray::Bool(b))) if equality => compare(a, b, bc),
+            (AnyArray::Bool(a), Operand::Bool(v)) if equality => Some(compare_scalar(a, |x| bc(x, *v))),
+            _ => None,
         };
-        bool_array(py, bytes, a.shape())
+        if let Some(mask) = mask {
+            return PyArray::from_any(AnyArray::Bool(mask)).into_py(py);
+        }
+        if !matches!(operand, Operand::Other) || numpy_handles(other) {
+            let name = match op {
+                CompareOp::Lt => "less",
+                CompareOp::Le => "less_equal",
+                CompareOp::Eq => "equal",
+                CompareOp::Ne => "not_equal",
+                CompareOp::Gt => "greater",
+                CompareOp::Ge => "greater_equal",
+            };
+            return fallback(py, "call", (name, slf.clone(), other.clone()), None);
+        }
+        Ok(not_implemented(py))
     }
 
     // ---- DLPack ----
@@ -777,7 +1022,7 @@ impl PyArray {
         }
         // copy=True: export a fresh copy; the capsule keeps it alive.
         let owner = if copy == Some(true) {
-            Py::new(slf.py(), PyArray::new(slf.get().inner().clone()))?.into_bound(slf.py())
+            Py::new(slf.py(), PyArray::from_any(slf.get().arr().clone()))?.into_bound(slf.py())
         } else {
             slf.clone()
         };
@@ -794,22 +1039,22 @@ impl PyArray {
     // ---- bitwise operators: NumPy decides (TypeError for float arrays, like NumPy) ----
 
     fn __and__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("bitwise_and", slf.clone(), other.clone()), None)
+        bitwise(slf, other, false, "bitwise_and", |x, y| x & y, |x, y| x & y)
     }
     fn __rand__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("bitwise_and", other.clone(), slf.clone()), None)
+        bitwise(slf, other, true, "bitwise_and", |x, y| x & y, |x, y| x & y)
     }
     fn __or__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("bitwise_or", slf.clone(), other.clone()), None)
+        bitwise(slf, other, false, "bitwise_or", |x, y| x | y, |x, y| x | y)
     }
     fn __ror__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("bitwise_or", other.clone(), slf.clone()), None)
+        bitwise(slf, other, true, "bitwise_or", |x, y| x | y, |x, y| x | y)
     }
     fn __xor__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("bitwise_xor", slf.clone(), other.clone()), None)
+        bitwise(slf, other, false, "bitwise_xor", |x, y| x ^ y, |x, y| x ^ y)
     }
     fn __rxor__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("bitwise_xor", other.clone(), slf.clone()), None)
+        bitwise(slf, other, true, "bitwise_xor", |x, y| x ^ y, |x, y| x ^ y)
     }
     fn __lshift__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         fallback(slf.py(), "call", ("left_shift", slf.clone(), other.clone()), None)
@@ -824,11 +1069,19 @@ impl PyArray {
         fallback(slf.py(), "call", ("right_shift", other.clone(), slf.clone()), None)
     }
     fn __invert__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        fallback(slf.py(), "call", ("invert", slf.clone()), None)
+        let py = slf.py();
+        match slf.get().arr() {
+            AnyArray::Bool(a) => PyArray::from_any(AnyArray::Bool(a.not())).into_py(py),
+            AnyArray::I64(a) => PyArray::from_any(AnyArray::I64(a.map_int(|x| !x))).into_py(py),
+            AnyArray::F64(_) => fallback(py, "call", ("invert", slf.clone()), None),
+        }
     }
 
-    fn __index__(&self) -> PyResult<isize> {
-        Err(PyTypeError::new_err("only integer scalar arrays can be converted to a scalar index"))
+    fn __index__(&self) -> PyResult<i64> {
+        match (self.arr(), self.arr().item()) {
+            (AnyArray::I64(_), Some(Scalar::I(v))) => Ok(v),
+            _ => Err(PyTypeError::new_err("only integer scalar arrays can be converted to a scalar index")),
+        }
     }
 
     fn __complex__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyComplex>> {
@@ -838,11 +1091,11 @@ impl PyArray {
     // ---- copying and pickling (matplotlib calls copy.copy on its inputs) ----
 
     fn __copy__(&self) -> PyArray {
-        PyArray::new(self.inner().clone())
+        PyArray::from_any(self.arr().clone())
     }
 
     fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyArray {
-        PyArray::new(self.inner().clone())
+        PyArray::from_any(self.arr().clone())
     }
 
     fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyAny>,))> {
@@ -855,14 +1108,27 @@ impl PyArray {
     /// No-op used only to measure raw PyO3 method-call overhead in benchmarks.
     fn _noop(&self) {}
 
-    fn __neg__(&self) -> PyArray {
-        PyArray::new(self.inner().map(|x| -x))
+    fn __neg__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        match slf.get().arr() {
+            AnyArray::F64(a) => PyArray::new(a.map(|x| -x)).into_py(py),
+            AnyArray::I64(a) => PyArray::from_any(AnyArray::I64(a.map_int(i64::wrapping_neg))).into_py(py),
+            AnyArray::Bool(_) => fallback(py, "call", ("negative", slf.clone()), None),
+        }
     }
-    fn __pos__(&self) -> PyArray {
-        PyArray::new(self.inner().clone())
+    fn __pos__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        match slf.get().arr() {
+            AnyArray::Bool(_) => fallback(slf.py(), "call", ("positive", slf.clone()), None),
+            other => PyArray::from_any(other.clone()).into_py(slf.py()),
+        }
     }
-    fn __abs__(&self) -> PyArray {
-        PyArray::new(self.inner().map(f64::abs))
+    fn __abs__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        match slf.get().arr() {
+            AnyArray::F64(a) => PyArray::new(a.map(f64::abs)).into_py(py),
+            AnyArray::I64(a) => PyArray::from_any(AnyArray::I64(a.map_int(i64::wrapping_abs))).into_py(py),
+            AnyArray::Bool(a) => PyArray::from_any(AnyArray::Bool(a.clone())).into_py(py),
+        }
     }
 
     // ---- reductions ----
@@ -939,8 +1205,7 @@ impl PyArray {
     /// 1-D inner product natively; matrices and other operands through NumPy.
     fn dot(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        if let Ok(b) = other.cast::<PyArray>() {
-            let (a, b) = (slf.get().inner(), b.get().inner());
+        if let (Some(a), Some(b)) = (slf.get().f64(), f64_of(other)) {
             if a.ndim() == 1 && b.ndim() == 1 {
                 return np_float(py, a.dot1d(b)?);
             }
@@ -968,7 +1233,9 @@ impl PyArray {
                 if lo.is_none() && hi.is_none() {
                     return Err(PyValueError::new_err("One of max or min must be given"));
                 }
-                let a = slf.get().inner();
+                let Some(a) = slf.get().f64() else {
+                    return call_method_fallback(slf, "clip", args, kwargs);
+                };
                 return PyArray::new(a.map(|x| {
                     let x = lo.map_or(x, |l| if x < l { l } else { x });
                     hi.map_or(x, |h| if x > h { h } else { x })
@@ -993,7 +1260,9 @@ impl PyArray {
         match decimals {
             Some(d) => {
                 let scale = 10f64.powi(d);
-                let a = slf.get().inner();
+                let Some(a) = slf.get().f64() else {
+                    return call_method_fallback(slf, "round", args, kwargs);
+                };
                 PyArray::new(a.map(|x| round_half_even(x * scale) / scale)).into_py(py)
             }
             None => call_method_fallback(slf, "round", args, kwargs),
@@ -1008,37 +1277,33 @@ impl PyArray {
         if kwargs.map_or(false, |k| !k.is_empty()) {
             return call_method_fallback(slf, "reshape", shape, kwargs);
         }
-        let arr = slf.get().inner();
+        let arr = slf.get().arr();
         let shape = extract_shape_args(shape, arr.size())?;
-        PyArray::new(arr.reshape(&shape)?).into_py(py)
+        PyArray::from_any(arr.reshape(&shape)?).into_py(py)
     }
 
     #[pyo3(signature = (*args, **kwargs))]
     fn copy<'py>(slf: &Bound<'py, Self>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
-        let py = slf.py();
         if c_order_only(args, kwargs)? {
-            let native = |a: &Array| PyArray::new(a.clone()).into_py(py);
-            return native(slf.get().inner());
+            return PyArray::from_any(slf.get().arr().clone()).into_py(slf.py());
         }
         call_method_fallback(slf, "copy", args, kwargs)
     }
 
     #[pyo3(signature = (*args, **kwargs))]
     fn flatten<'py>(slf: &Bound<'py, Self>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
-        let py = slf.py();
         if c_order_only(args, kwargs)? {
-            let native = |a: &Array| PyArray::new(a.reshape(&[a.size()])?).into_py(py);
-            return native(slf.get().inner());
+            let arr = slf.get().arr();
+            return PyArray::from_any(arr.reshape(&[arr.size()])?).into_py(slf.py());
         }
         call_method_fallback(slf, "flatten", args, kwargs)
     }
 
     #[pyo3(signature = (*args, **kwargs))]
     fn ravel<'py>(slf: &Bound<'py, Self>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
-        let py = slf.py();
         if c_order_only(args, kwargs)? {
-            let native = |a: &Array| PyArray::new(a.reshape(&[a.size()])?).into_py(py);
-            return native(slf.get().inner());
+            let arr = slf.get().arr();
+            return PyArray::from_any(arr.reshape(&[arr.size()])?).into_py(slf.py());
         }
         call_method_fallback(slf, "ravel", args, kwargs)
     }
@@ -1047,7 +1312,7 @@ impl PyArray {
     #[getter]
     #[pyo3(name = "T")]
     fn transpose_property(&self) -> PyArray {
-        PyArray::new(self.inner().transpose())
+        PyArray::from_any(self.arr().transpose())
     }
 
     /// `transpose()` with no axes natively; explicit axes through NumPy.
@@ -1056,7 +1321,7 @@ impl PyArray {
         let py = slf.py();
         let bare = kwargs.map_or(true, |k| k.is_empty()) && (args.is_empty() || (args.len() == 1 && args.get_item(0)?.is_none()));
         if bare {
-            return PyArray::new(slf.get().inner().transpose()).into_py(py);
+            return PyArray::from_any(slf.get().arr().transpose()).into_py(py);
         }
         call_method_fallback(slf, "transpose", args, kwargs)
     }
@@ -1068,22 +1333,29 @@ impl PyArray {
     /// broadcasting) is applied by NumPy through the writable view.
     fn __setitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let py = slf.py();
-        let scalar = match classify(value) {
-            Operand::Scalar(v) => Some(v),
-            _ => None,
-        };
-        // Native only for a full integer index; partial indices broadcast the
-        // value into a sub-array, which NumPy does through the view.
-        if let Some(v) = scalar {
-            let ndim = slf.get().inner().ndim();
-            if key.is_instance_of::<PyInt>() && ndim == 1 {
-                return Ok(slf.get().inner_mut().set(&[key.extract::<isize>()?], v)?);
+        // Native only for a full integer index with a value of the array's
+        // own kind; everything else (partial indices, slices, masks, casts)
+        // is NumPy's assignment through the writable view.
+        let ndim = slf.get().arr().ndim();
+        let idx: Option<Vec<isize>> = if key.is_instance_of::<PyInt>() && ndim == 1 {
+            Some(vec![key.extract::<isize>()?])
+        } else if let Ok(tuple) = key.cast::<PyTuple>() {
+            if tuple.len() == ndim && tuple.iter().all(|item| item.is_instance_of::<PyInt>()) {
+                Some(tuple.extract()?)
+            } else {
+                None
             }
-            if let Ok(tuple) = key.cast::<PyTuple>() {
-                if tuple.len() == ndim && tuple.iter().all(|item| item.is_instance_of::<PyInt>()) {
-                    let idx: Vec<isize> = tuple.extract()?;
-                    return Ok(slf.get().inner_mut().set(&idx, v)?);
+        } else {
+            None
+        };
+        if let Some(idx) = idx {
+            match (slf.get().arr_mut(), classify(value)) {
+                (AnyArray::F64(a), v @ (Operand::Float(_) | Operand::Int(_) | Operand::Bool(_))) => {
+                    return Ok(a.set(&idx, v.scalar().expect("scalar"))?);
                 }
+                (AnyArray::I64(a), Operand::Int(i)) => return Ok(a.set(&idx, i)?),
+                (AnyArray::Bool(a), Operand::Bool(b)) => return Ok(a.set(&idx, b)?),
+                _ => {}
             }
         }
         fallback(py, "setitem", (slf.clone(), key.clone(), value.clone()), None)?;
@@ -1114,13 +1386,11 @@ impl PyArray {
 
     /// `a.fill(value)` in place.
     fn fill(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        match classify(value) {
-            Operand::Scalar(v) => {
-                slf.get().inner_mut().map_inplace(|_| v);
-                Ok(())
-            }
-            _ => fallback(slf.py(), "call_method", (slf.clone(), "fill", value.clone()), None).map(|_| ()),
+        if let (Some(a), Some(v)) = (slf.get().f64_mut(), classify(value).scalar()) {
+            a.map_inplace(|_| v);
+            return Ok(());
         }
+        fallback(slf.py(), "call_method", (slf.clone(), "fill", value.clone()), None).map(|_| ())
     }
 
     // ---- indexing ----
@@ -1129,7 +1399,7 @@ impl PyArray {
     /// ellipsis, None, fancy and boolean indexing through NumPy.
     fn __getitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let arr = slf.get().inner();
+        let arr = slf.get().arr();
         // Type checks first: a failed `extract` builds a Python exception,
         // which costs more than the whole slice.
         if key.is_instance_of::<PyInt>() {
@@ -1139,7 +1409,7 @@ impl PyArray {
             if arr.ndim() == 0 {
                 return Err(PyIndexError::new_err("too many indices for array: array is 0-dimensional"));
             }
-            return PyArray::new(arr.select(&[slice_selector(slice, arr.shape()[0])?])?).into_py(py);
+            return PyArray::from_any(arr.select(&[slice_selector(slice, arr.shape()[0])?])?).into_py(py);
         }
         if let Ok(tuple) = key.cast::<PyTuple>() {
             let mut ints = Vec::with_capacity(tuple.len());
@@ -1176,18 +1446,18 @@ impl PyArray {
             }
             let selected = arr.select(&sels)?;
             if new_axes.is_empty() {
-                return PyArray::new(selected).into_py(py);
+                return PyArray::from_any(selected).into_py(py);
             }
             let mut shape: Vec<usize> = selected.shape().to_vec();
             for &pos in &new_axes {
                 shape.insert(pos.min(shape.len()), 1);
             }
-            return PyArray::new(selected.reshape(&shape)?).into_py(py);
+            return PyArray::from_any(selected.reshape(&shape)?).into_py(py);
         }
         if key.is_none() {
             let mut shape = vec![1];
             shape.extend_from_slice(arr.shape());
-            return PyArray::new(arr.reshape(&shape)?).into_py(py);
+            return PyArray::from_any(arr.reshape(&shape)?).into_py(py);
         }
         // A list of integers: rows along the leading axis.
         if let Ok(list) = key.cast::<PyList>() {
@@ -1199,12 +1469,19 @@ impl PyArray {
                     return fallback(py, "getitem", (slf.clone(), key.clone()), None);
                 }
             }
-            return PyArray::new(arr.take_leading(&idx)?).into_py(py);
+            return PyArray::from_any(arr.take_leading(&idx)?).into_py(py);
         }
-        // A boolean mask of the array's shape (a NumPy bool array from a comparison).
+        // An int64 lightarray used as an index array along the leading axis.
+        if let Some(AnyArray::I64(index)) = any_of(key) {
+            if index.ndim() == 1 {
+                let idx: Vec<isize> = index.data().iter().map(|&i| i as isize).collect();
+                return PyArray::from_any(arr.take_leading(&idx)?).into_py(py);
+            }
+        }
+        // A boolean mask of the array's shape (a lightarray or NumPy bool array).
         if let Some(mask) = bool_mask(key) {
             if mask.1 == arr.shape() {
-                return PyArray::new(arr.compress_flat(&mask.0)?).into_py(py);
+                return PyArray::from_any(arr.compress_flat(&mask.0)?).into_py(py);
             }
         }
         // NumPy integer scalars (and anything else with __index__) index too.
@@ -1232,33 +1509,67 @@ fn inplace_op<F: Fn(f64, f64) -> f64>(
     f: F,
 ) -> PyResult<()> {
     let py = slf.py();
-    match classify(other) {
-        Operand::Array(b) => {
-            if b.is(slf) {
-                let copy = b.get().inner().clone();
-                slf.get().inner_mut().zip_map_inplace(&copy, f)?;
+    let operand = classify(other);
+    let numpy_inplace = || fallback(py, "inplace", (slf.clone(), name, other.clone()), None).map(|_| ());
+    // int64 and bool targets follow NumPy's casting rules through the view
+    let Some(a) = slf.get().f64_mut() else {
+        return numpy_inplace();
+    };
+    match operand {
+        Operand::F64(b) => {
+            if std::ptr::eq(b as *const Array<f64>, a as *const Array<f64>) {
+                let copy = a.clone();
+                a.zip_map_inplace(&copy, f)?;
             } else {
-                slf.get().inner_mut().zip_map_inplace(b.get().inner(), f)?;
+                a.zip_map_inplace(b, f)?;
             }
         }
-        Operand::Scalar(v) => slf.get().inner_mut().map_inplace(|x| f(x, v)),
-        Operand::Other if numpy_handles(other) => {
-            fallback(py, "inplace", (slf.clone(), name, other.clone()), None)?;
-        }
+        Operand::Alt(b) => a.zip_map_inplace(&b.to_f64(), f)?,
+        Operand::Other if numpy_handles(other) => return numpy_inplace(),
         Operand::Other => {
             return Err(PyTypeError::new_err(format!(
                 "unsupported operand type(s) for in-place {name}: 'lightarray.ndarray' and '{}'",
                 other.get_type().name()?
             )))
         }
+        scalar => {
+            let v = scalar.scalar().expect("remaining variants are scalars");
+            a.map_inplace(|x| f(x, v));
+        }
     }
     Ok(())
 }
 
-fn index_result(py: Python<'_>, arr: &Array, idx: &[isize]) -> PyResult<Py<PyAny>> {
+fn index_result(py: Python<'_>, arr: &AnyArray, idx: &[isize]) -> PyResult<Py<PyAny>> {
     match arr.get(idx)? {
-        Some(v) => np_float(py, v),
-        None => PyArray::new(arr.index(idx)?).into_py(py),
+        Some(Scalar::F(v)) => np_float(py, v),
+        Some(Scalar::I(v)) => np_i64(py, v),
+        Some(Scalar::B(v)) => np_bool(py, v),
+        None => PyArray::from_any(arr.index(idx)?).into_py(py),
+    }
+}
+
+/// Bitwise operators: masks and integer arrays natively, NumPy otherwise
+/// (float operands raise TypeError there, as NumPy does).
+fn bitwise(
+    slf: &Bound<'_, PyArray>,
+    other: &Bound<'_, PyAny>,
+    reflected: bool,
+    name: &str,
+    bf: fn(bool, bool) -> bool,
+    intf: fn(i64, i64) -> i64,
+) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    let result = match (slf.get().arr(), classify(other)) {
+        (AnyArray::Bool(a), Operand::Alt(AnyArray::Bool(b))) => a.zip_bool(b, bf).map(AnyArray::Bool),
+        (AnyArray::Bool(a), Operand::Bool(v)) => Some(AnyArray::Bool(compare_scalar(a, |x| bf(x, v)))),
+        (AnyArray::I64(a), Operand::Alt(AnyArray::I64(b))) => a.zip_int(b, intf).map(AnyArray::I64),
+        (AnyArray::I64(a), Operand::Int(i)) => Some(AnyArray::I64(a.map_int(|x| intf(x, i)))),
+        _ => None,
+    };
+    match result {
+        Some(r) => PyArray::from_any(r).into_py(py),
+        None => numpy_binary(py, slf, other, reflected, name),
     }
 }
 
@@ -1296,13 +1607,13 @@ pub fn extract_shape(shape: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
     shape.extract::<Vec<usize>>().map_err(|_| PyTypeError::new_err("shape must be an int or a sequence of ints"))
 }
 
-/// `array(obj)` / `asarray(obj)`: a lightarray array when the input is
-/// float64-representable natively or NumPy makes a float64 array of it;
-/// otherwise NumPy's array with its own dtype (complex, int, str, ...), so
-/// dtype semantics match NumPy for inputs lightarray cannot hold yet.
+/// `array(obj)` / `asarray(obj)`: a lightarray array when the input maps to
+/// float64, int64 or bool (nested Python sequences, numbers, NumPy arrays of
+/// those dtypes); otherwise NumPy's array with its own dtype (complex,
+/// int32, str, ...).
 pub fn array_or_numpy(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     if let Some(arr) = native_array(py, obj)? {
-        return PyArray::new(arr).into_py(py);
+        return PyArray::from_any(arr).into_py(py);
     }
     let np = py.import("numpy")?;
     let converted = np.getattr("asarray")?.call1((obj,))?;
@@ -1310,41 +1621,39 @@ pub fn array_or_numpy(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Py<PyA
 }
 
 /// Native conversion only (lightarray arrays, numbers, nested sequences of
-/// numbers, float64 buffers); None for everything else.
-fn native_array(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Option<Array>> {
-    if let Ok(a) = obj.cast::<PyArray>() {
-        return Ok(Some(a.get().inner().clone()));
+/// numbers, float64/int64/bool buffers); None for everything else. The
+/// dtype follows NumPy's inference: any float makes float64, integers make
+/// int64, only bools make bool.
+fn native_array(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Option<AnyArray>> {
+    if let Some(a) = any_of(obj) {
+        return Ok(Some(a.clone()));
     }
     if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
         return nested_sequence(obj);
     }
-    if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyInt>() {
-        return Ok(Some(Array::scalar(obj.extract()?)));
+    if obj.is_instance_of::<PyFloat>() {
+        return Ok(Some(AnyArray::F64(Array::scalar(obj.extract()?))));
+    }
+    if obj.is_instance_of::<PyBool>() {
+        return Ok(Some(AnyArray::Bool(Array::scalar(obj.is_truthy()?))));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        return Ok(obj.extract::<i64>().ok().map(|v| AnyArray::I64(Array::scalar(v))));
     }
     if has_buffer(obj) {
-        // NumPy scalars and 0-d arrays keep their own dtype (only float64
-        // ones become lightarray); Python numbers above become float64.
-        return PyArray::from_f64_buffer(py, obj, false);
+        return PyArray::from_buffer_any(py, obj);
     }
     Ok(None)
 }
 
-/// Build an `Array` from anything NumPy's `array()` accepts, coercing to
-/// float64 through NumPy when needed (used where a float64 array is required).
+/// Build a float64 `Array` from anything NumPy's `array()` accepts, coercing
+/// other dtypes (used where float64 is required).
 pub fn array_from_any(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Array> {
-    if let Ok(a) = obj.cast::<PyArray>() {
-        return Ok(a.get().inner().clone());
-    }
-    if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
-        if let Some(arr) = nested_sequence(obj)? {
-            return Ok(arr);
-        }
-    } else if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyInt>() {
-        return Ok(Array::scalar(obj.extract()?));
-    } else if has_buffer(obj) {
-        if let Some(arr) = PyArray::from_f64_buffer(py, obj, true)? {
-            return Ok(arr);
-        }
+    if let Some(any) = native_array(py, obj)? {
+        return Ok(match any {
+            AnyArray::F64(a) => a,
+            other => other.to_f64(),
+        });
     }
     let np = py.import("numpy")?;
     let kw = PyDict::new(py);
@@ -1360,71 +1669,98 @@ fn has_buffer(obj: &Bound<'_, PyAny>) -> bool {
     unsafe { ffi::PyObject_CheckBuffer(obj.as_ptr()) == 1 }
 }
 
-/// Shape being discovered while walking nested sequences; fixed-size so the
-/// walk allocates nothing but the data.
-struct ShapeAcc {
-    len: usize,
+/// State of a walk over nested sequences; fixed-size so the walk allocates
+/// nothing but the data. Integers are kept exactly (in `ints`) until a float
+/// shows up, because float64 cannot hold every int64.
+struct Walk {
+    ndim: usize,
     dims: [usize; crate::dims::MAX_NDIM],
+    floats: Vec<f64>,
+    ints: Vec<i64>,
+    saw_float: bool,
+    saw_int: bool,
+    saw_bool: bool,
 }
 
 /// Rectangular nested lists/tuples of numbers. Returns None when the input is
 /// not such a structure (ragged, contains strings, contains arrays, ...).
-fn nested_sequence(obj: &Bound<'_, PyAny>) -> PyResult<Option<Array>> {
-    let mut data = Vec::new();
-    let mut shape = ShapeAcc { len: 0, dims: [0; crate::dims::MAX_NDIM] };
-    if !walk(obj, 0, &mut shape, &mut data)? {
+fn nested_sequence(obj: &Bound<'_, PyAny>) -> PyResult<Option<AnyArray>> {
+    let mut w = Walk { ndim: 0, dims: [0; crate::dims::MAX_NDIM], floats: Vec::new(), ints: Vec::new(), saw_float: false, saw_int: false, saw_bool: false };
+    if !walk(obj, 0, &mut w)? {
         return Ok(None);
     }
-    let shape = &shape.dims[..shape.len];
+    let shape = &w.dims[..w.ndim];
     // Mixed scalars and sequences at one level slip past `walk`; let NumPy
     // produce the proper error for those.
-    if data.len() != shape.iter().product::<usize>() {
+    if w.floats.len() != shape.iter().product::<usize>() {
         return Ok(None);
     }
-    Ok(Some(Array::new(data, shape)?))
+    Ok(Some(if w.saw_float || !(w.saw_int || w.saw_bool) {
+        AnyArray::F64(Array::new(w.floats, shape)?)
+    } else if w.saw_int {
+        AnyArray::I64(Array::new(w.ints, shape)?)
+    } else {
+        AnyArray::Bool(Array::new(w.ints.iter().map(|&v| v != 0).collect(), shape)?)
+    }))
 }
 
-fn walk(obj: &Bound<'_, PyAny>, depth: usize, shape: &mut ShapeAcc, data: &mut Vec<f64>) -> PyResult<bool> {
+fn walk(obj: &Bound<'_, PyAny>, depth: usize, w: &mut Walk) -> PyResult<bool> {
     if let Ok(list) = obj.cast::<PyList>() {
-        walk_items(list.len(), list.iter(), depth, shape, data)
+        walk_items(list.len(), list.iter(), depth, w)
     } else if let Ok(tuple) = obj.cast::<PyTuple>() {
-        walk_items(tuple.len(), tuple.iter(), depth, shape, data)
+        walk_items(tuple.len(), tuple.iter(), depth, w)
     } else {
         Ok(false)
     }
 }
 
-fn walk_items<'py>(
-    len: usize,
-    items: impl Iterator<Item = Bound<'py, PyAny>>,
-    depth: usize,
-    shape: &mut ShapeAcc,
-    data: &mut Vec<f64>,
-) -> PyResult<bool> {
-    if depth == shape.len {
+fn walk_items<'py>(len: usize, items: impl Iterator<Item = Bound<'py, PyAny>>, depth: usize, w: &mut Walk) -> PyResult<bool> {
+    if depth == w.ndim {
         if depth + 1 > crate::dims::MAX_NDIM {
             return Ok(false);
         }
-        shape.dims[depth] = len;
-        shape.len += 1;
-    } else if shape.dims[depth] != len {
+        w.dims[depth] = len;
+        w.ndim += 1;
+    } else if w.dims[depth] != len {
         return Ok(false);
     }
     if depth == 0 {
-        data.reserve(len);
+        w.floats.reserve(len);
     }
     for item in items {
         if let Ok(f) = item.cast_exact::<PyFloat>() {
-            if depth + 1 != shape.len {
+            if depth + 1 != w.ndim {
                 return Ok(false);
             }
-            data.push(f.value());
-        } else if item.is_instance_of::<PyFloat>() || item.is_instance_of::<PyInt>() {
-            if depth + 1 != shape.len {
+            w.floats.push(f.value());
+            w.saw_float = true;
+        } else if item.is_instance_of::<PyBool>() {
+            if depth + 1 != w.ndim {
                 return Ok(false);
             }
-            data.push(item.extract()?);
-        } else if !walk(&item, depth + 1, shape, data)? {
+            let v = item.is_truthy()?;
+            w.floats.push(v as u8 as f64);
+            if !w.saw_float {
+                w.ints.push(v as i64);
+            }
+            w.saw_bool = true;
+        } else if item.is_instance_of::<PyInt>() {
+            if depth + 1 != w.ndim {
+                return Ok(false);
+            }
+            let Ok(v) = item.extract::<i64>() else { return Ok(false) }; // beyond int64: NumPy decides
+            w.floats.push(v as f64);
+            if !w.saw_float {
+                w.ints.push(v);
+            }
+            w.saw_int = true;
+        } else if item.is_instance_of::<PyFloat>() {
+            if depth + 1 != w.ndim {
+                return Ok(false);
+            }
+            w.floats.push(item.extract()?);
+            w.saw_float = true;
+        } else if !walk(&item, depth + 1, w)? {
             return Ok(false);
         }
     }

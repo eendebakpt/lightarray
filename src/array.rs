@@ -5,8 +5,8 @@ use crate::dims::{Dims, DimsError};
 use std::fmt;
 
 #[derive(Clone)]
-pub struct Array {
-    pub(crate) data: Vec<f64>,
+pub struct Array<T = f64> {
+    pub(crate) data: Vec<T>,
     pub(crate) dims: Dims,
 }
 
@@ -89,51 +89,66 @@ impl From<DimsError> for ArrayError {
 
 pub type Result<T> = std::result::Result<T, ArrayError>;
 
-impl Array {
-    pub fn new(data: Vec<f64>, shape: &[usize]) -> Result<Array> {
-        let dims = Dims::from_shape(shape)?;
+/// Element types an `Array` can hold.
+pub trait Element: Copy + PartialEq + Default + fmt::Debug + 'static {}
+impl Element for f64 {}
+impl Element for i64 {}
+impl Element for bool {}
+
+// ---- structure: construction, indexing, reshaping (any element type) ----
+impl<T: Element> Array<T> {
+    pub fn new(data: Vec<T>, shape: &[usize]) -> Result<Array<T>> {
+        let dims = Dims::with_itemsize(shape, std::mem::size_of::<T>())?;
         if dims.size() != data.len() {
             return Err(ArrayError::SizeMismatch { expected: dims.size(), got: data.len() });
         }
         Ok(Array { data, dims })
     }
 
-    pub fn scalar(value: f64) -> Array {
-        Array { data: vec![value], dims: Dims::scalar() }
+
+    pub fn scalar(value: T) -> Array<T> {
+        Array { data: vec![value], dims: Dims::scalar_with(std::mem::size_of::<T>()) }
     }
 
-    pub fn filled(shape: &[usize], value: f64) -> Result<Array> {
-        let dims = Dims::from_shape(shape)?;
+
+    pub fn filled(shape: &[usize], value: T) -> Result<Array<T>> {
+        let dims = Dims::with_itemsize(shape, std::mem::size_of::<T>())?;
         Ok(Array { data: vec![value; dims.size()], dims })
     }
+
 
     #[inline]
     pub fn shape(&self) -> &[usize] {
         self.dims.shape()
     }
 
+
     #[inline]
     pub fn ndim(&self) -> usize {
         self.dims.ndim()
     }
+
 
     #[inline]
     pub fn size(&self) -> usize {
         self.data.len()
     }
 
+
     #[inline]
-    pub fn data(&self) -> &[f64] {
+    pub fn data(&self) -> &[T] {
         &self.data
     }
 
+
     #[inline]
-    pub fn data_mut(&mut self) -> &mut [f64] {
+    pub fn data_mut(&mut self) -> &mut [T] {
         &mut self.data
     }
 
+
     /// `a[i, j, ...] = value` for a full integer index.
-    pub fn set(&mut self, indices: &[isize], value: f64) -> Result<()> {
+    pub fn set(&mut self, indices: &[isize], value: T) -> Result<()> {
         let (offset, dims) = self.locate(indices)?;
         if dims.ndim() != 0 {
             return Err(ArrayError::Message(format!(
@@ -146,6 +161,223 @@ impl Array {
         Ok(())
     }
 
+
+    /// Normalise a possibly negative index on `axis`.
+    fn normalize_index(&self, index: isize, axis: usize) -> Result<usize> {
+        let len = self.shape()[axis];
+        let i = if index < 0 { index + len as isize } else { index };
+        if i < 0 || i as usize >= len {
+            return Err(ArrayError::IndexOutOfBounds { index, axis, len });
+        }
+        Ok(i as usize)
+    }
+
+
+    /// Index with one integer per leading axis. Returns the flat offset of
+    /// the addressed sub-array and its dims.
+    fn locate(&self, indices: &[isize]) -> Result<(usize, Dims)> {
+        if indices.len() > self.ndim() {
+            return Err(ArrayError::TooManyIndices { given: indices.len(), ndim: self.ndim() });
+        }
+        let mut offset = 0usize;
+        for (axis, &idx) in indices.iter().enumerate() {
+            let i = self.normalize_index(idx, axis)?;
+            offset += i * (self.dims.strides()[axis] as usize / std::mem::size_of::<T>());
+        }
+        Ok((offset, self.dims.drop_leading(indices.len())))
+    }
+
+
+    /// `a[i, j, ...]` with integers only. A full index returns a scalar
+    /// array (0-d); a partial one returns a copy of the sub-array.
+    pub fn index(&self, indices: &[isize]) -> Result<Array<T>> {
+        let (offset, dims) = self.locate(indices)?;
+        let n = dims.size();
+        Ok(Array { data: self.data[offset..offset + n].to_vec(), dims })
+    }
+
+
+    /// Scalar element for a full integer index.
+    pub fn get(&self, indices: &[isize]) -> Result<Option<T>> {
+        let (offset, dims) = self.locate(indices)?;
+        Ok(if dims.ndim() == 0 { Some(self.data[offset]) } else { None })
+    }
+
+
+    /// General basic indexing: one selector per leading axis, remaining axes
+    /// taken whole. Integer selectors drop their axis; slices keep it. The
+    /// result is a copy (views arrive in Phase 4).
+    pub fn select(&self, sels: &[Selector]) -> Result<Array<T>> {
+        if sels.len() > self.ndim() {
+            return Err(ArrayError::TooManyIndices { given: sels.len(), ndim: self.ndim() });
+        }
+        let shape = self.shape();
+        // Per axis: (start, step, count) in elements of that axis.
+        let mut plan: Vec<(usize, isize, usize)> = Vec::with_capacity(self.ndim());
+        let mut out_shape: Vec<usize> = Vec::with_capacity(self.ndim());
+        for axis in 0..self.ndim() {
+            match sels.get(axis) {
+                Some(Selector::Int(i)) => {
+                    let i = self.normalize_index(*i, axis)?;
+                    plan.push((i, 1, 1));
+                }
+                Some(Selector::Slice { start, stop, step }) => {
+                    let count = if *step > 0 {
+                        if stop > start { ((stop - start - 1) / step + 1) as usize } else { 0 }
+                    } else if start > stop {
+                        ((start - stop - 1) / -step + 1) as usize
+                    } else {
+                        0
+                    };
+                    plan.push((*start as usize, *step, count));
+                    out_shape.push(count);
+                }
+                None => {
+                    plan.push((0, 1, shape[axis]));
+                    out_shape.push(shape[axis]);
+                }
+            }
+        }
+        let out_size: usize = out_shape.iter().product();
+        let mut out = Vec::with_capacity(out_size);
+        if out_size > 0 {
+            let elem_strides: Vec<usize> = self.dims.strides().iter().map(|&s| s as usize / std::mem::size_of::<T>()).collect();
+            gather(&self.data, &plan, &elem_strides, 0, 0, &mut out);
+        }
+        Array::new(out, &out_shape)
+    }
+
+
+    /// Join arrays of equal ndim along `axis`; all other dimensions must match.
+    pub fn concatenate(parts: &[&Array<T>], axis: isize) -> Result<Array<T>> {
+        let first = parts.first().ok_or_else(|| ArrayError::Message("need at least one array to concatenate".into()))?;
+        let ndim = first.ndim() as isize;
+        if ndim == 0 {
+            return Err(ArrayError::Message("zero-dimensional arrays cannot be concatenated".into()));
+        }
+        if axis < -ndim || axis >= ndim {
+            return Err(ArrayError::Message(format!("axis {axis} is out of bounds for array of dimension {ndim}")));
+        }
+        let axis = if axis < 0 { (axis + ndim) as usize } else { axis as usize };
+        let mut out_shape = first.shape().to_vec();
+        out_shape[axis] = 0;
+        for p in parts {
+            if p.ndim() != first.ndim() {
+                return Err(ArrayError::Message("all the input arrays must have same number of dimensions".into()));
+            }
+            for (k, (&a, &b)) in p.shape().iter().zip(first.shape()).enumerate() {
+                if k != axis && a != b {
+                    return Err(ArrayError::Message(format!(
+                        "all the input array dimensions except for the concatenation axis must match exactly, but along dimension {k}, sizes {b} and {a} differ"
+                    )));
+                }
+            }
+            out_shape[axis] += p.shape()[axis];
+        }
+        let outer: usize = first.shape()[..axis].iter().product();
+        let inner: usize = first.shape()[axis + 1..].iter().product();
+        let mut data = Vec::with_capacity(out_shape.iter().product());
+        for o in 0..outer {
+            for p in parts {
+                let block = p.shape()[axis] * inner;
+                data.extend_from_slice(&p.data[o * block..(o + 1) * block]);
+            }
+        }
+        Array::new(data, &out_shape)
+    }
+
+
+    /// `where(cond, x, y)` with a boolean mask of the same shape.
+    pub fn select_where(cond: &[bool], x: &Array<T>, y: &Array<T>) -> Result<Array<T>> {
+        if x.dims != y.dims || cond.len() != x.size() {
+            return Err(ArrayError::ShapeMismatch(x.shape().to_vec(), y.shape().to_vec()));
+        }
+        let data = cond.iter().zip(&x.data).zip(&y.data).map(|((&c, &a), &b)| if c { a } else { b }).collect();
+        Ok(Array { data, dims: x.dims })
+    }
+
+
+    /// Reverse the axes (NumPy's `.T`). 0-d and 1-d arrays are returned as
+    /// copies; 2-d is transposed directly; higher dims go through a general
+    /// permutation.
+    pub fn transpose(&self) -> Array<T> {
+        match self.ndim() {
+            0 | 1 => self.clone(),
+            2 => {
+                let (rows, cols) = (self.shape()[0], self.shape()[1]);
+                let mut data = Vec::with_capacity(self.size());
+                for c in 0..cols {
+                    for r in 0..rows {
+                        data.push(self.data[r * cols + c]);
+                    }
+                }
+                Array { data, dims: Dims::with_itemsize(&[cols, rows], std::mem::size_of::<T>()).expect("2-d") }
+            }
+            _ => {
+                let shape = self.shape();
+                let ndim = shape.len();
+                let rev_shape: Vec<usize> = shape.iter().rev().copied().collect();
+                let strides: Vec<usize> = self.dims.strides().iter().map(|&s| s as usize / std::mem::size_of::<T>()).collect();
+                let mut data = Vec::with_capacity(self.size());
+                let mut idx = vec![0usize; ndim];
+                for _ in 0..self.size() {
+                    // idx is a multi-index into the transposed array; source offset uses reversed axes
+                    let off: usize = (0..ndim).map(|k| idx[k] * strides[ndim - 1 - k]).sum();
+                    data.push(self.data[off]);
+                    for k in (0..ndim).rev() {
+                        idx[k] += 1;
+                        if idx[k] < rev_shape[k] {
+                            break;
+                        }
+                        idx[k] = 0;
+                    }
+                }
+                Array { data, dims: Dims::with_itemsize(&rev_shape, std::mem::size_of::<T>()).expect("same ndim") }
+            }
+        }
+    }
+
+
+    /// `a[mask]` with a boolean mask over the whole array (mask shape equals
+    /// the array shape): the selected elements as a 1-D array.
+    pub fn compress_flat(&self, mask: &[bool]) -> Result<Array<T>> {
+        if mask.len() != self.size() {
+            return Err(ArrayError::Message(format!(
+                "boolean index did not match indexed array; size {} but corresponding boolean size is {}",
+                self.size(),
+                mask.len()
+            )));
+        }
+        let data: Vec<T> = self.data.iter().zip(mask).filter(|(_, &m)| m).map(|(&x, _)| x).collect();
+        let n = data.len();
+        Array::new(data, &[n])
+    }
+
+
+    /// `a[[i, j, ...]]`: rows along the leading axis, negative indices allowed.
+    pub fn take_leading(&self, indices: &[isize]) -> Result<Array<T>> {
+        if self.ndim() == 0 {
+            return Err(ArrayError::TooManyIndices { given: 1, ndim: 0 });
+        }
+        let row = self.dims.drop_leading(1).size();
+        let mut data = Vec::with_capacity(indices.len() * row);
+        for &i in indices {
+            let i = self.normalize_index(i, 0)?;
+            data.extend_from_slice(&self.data[i * row..(i + 1) * row]);
+        }
+        let mut shape = vec![indices.len()];
+        shape.extend_from_slice(&self.shape()[1..]);
+        Array::new(data, &shape)
+    }
+
+
+    pub fn reshape(&self, shape: &[usize]) -> Result<Array<T>> {
+        Array::new(self.data.clone(), shape)
+    }
+}
+
+// ---- float64 kernels ----
+impl Array<f64> {
     /// `self = f(self, other)` element-wise in place, with `other` broadcast
     /// to `self`'s shape (the result may not change shape, like NumPy's
     /// in-place operators).
@@ -169,6 +401,7 @@ impl Array {
         Ok(())
     }
 
+
     /// `self = f(self)` element-wise in place.
     pub fn map_inplace<F: Fn(f64) -> f64>(&mut self, f: F) {
         for a in self.data.iter_mut() {
@@ -176,7 +409,9 @@ impl Array {
         }
     }
 
+
     // ---- element-wise kernels ------------------------------------------
+
 
     /// `f(a[i], b[i])` with NumPy broadcasting. Equal shapes take the
     /// straight zipped loop; anything else goes through an odometer over the
@@ -189,6 +424,7 @@ impl Array {
         }
         self.zip_map_broadcast(other, f)
     }
+
 
     #[inline(never)]
     fn zip_map_broadcast<F: Fn(f64, f64) -> f64>(&self, other: &Array, f: F) -> Result<Array> {
@@ -221,13 +457,16 @@ impl Array {
         Array::new(out, &out_shape)
     }
 
+
     /// `f(a[i])`.
     #[inline]
     pub fn map<F: Fn(f64) -> f64>(&self, f: F) -> Array {
         Array { data: self.data.iter().map(|&a| f(a)).collect(), dims: self.dims }
     }
 
+
     // ---- reductions ----------------------------------------------------
+
 
     /// Sum with 8 independent accumulators so the loop vectorizes; a plain
     /// sequential f64 sum is not reassociable and stays scalar.
@@ -245,9 +484,11 @@ impl Array {
         ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
     }
 
+
     pub fn prod(&self) -> f64 {
         self.data.iter().product()
     }
+
 
     pub fn mean(&self) -> f64 {
         if self.data.is_empty() {
@@ -257,14 +498,17 @@ impl Array {
         }
     }
 
+
     /// NaN-propagating maximum, like `np.max`. Returns None when empty.
     pub fn max(&self) -> Option<f64> {
         self.data.iter().copied().reduce(|a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) })
     }
 
+
     pub fn min(&self) -> Option<f64> {
         self.data.iter().copied().reduce(|a, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) })
     }
+
 
     /// Fold along one axis. `init` seeds the accumulator; when None the
     /// first element along the axis seeds it (for max/min), which requires a
@@ -326,6 +570,7 @@ impl Array {
         Array::new(out, &out_shape)
     }
 
+
     /// Population variance (ddof = 0), two-pass like NumPy.
     pub fn var(&self) -> f64 {
         if self.data.is_empty() {
@@ -336,14 +581,17 @@ impl Array {
         self.data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n
     }
 
+
     /// Index of the first maximum; NaN wins, like NumPy.
     pub fn argmax(&self) -> Option<usize> {
         self.arg_extreme(|x, best| x > best)
     }
 
+
     pub fn argmin(&self) -> Option<usize> {
         self.arg_extreme(|x, best| x < best)
     }
+
 
     fn arg_extreme<F: Fn(f64, f64) -> bool>(&self, better: F) -> Option<usize> {
         let mut best_i = 0;
@@ -363,13 +611,16 @@ impl Array {
         Some(best_i)
     }
 
+
     pub fn any(&self) -> bool {
         self.data.iter().any(|&x| x != 0.0)
     }
 
+
     pub fn all(&self) -> bool {
         self.data.iter().all(|&x| x != 0.0)
     }
+
 
     /// Running fold over the flattened array (NumPy's `cumsum(axis=None)`).
     pub fn scan<F: Fn(f64, f64) -> f64>(&self, init: f64, f: F) -> Array {
@@ -377,6 +628,7 @@ impl Array {
         let data: Vec<f64> = self.data.iter().map(|&x| { acc = f(acc, x); acc }).collect();
         Array { data, dims: Dims::from_shape(&[self.size()]).expect("1-d") }
     }
+
 
     /// Inner product of two 1-D arrays of equal length.
     pub fn dot1d(&self, other: &Array) -> Result<f64> {
@@ -403,206 +655,9 @@ impl Array {
         Ok(((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail)
     }
 
+
     // ---- indexing ------------------------------------------------------
 
-    /// Normalise a possibly negative index on `axis`.
-    fn normalize_index(&self, index: isize, axis: usize) -> Result<usize> {
-        let len = self.shape()[axis];
-        let i = if index < 0 { index + len as isize } else { index };
-        if i < 0 || i as usize >= len {
-            return Err(ArrayError::IndexOutOfBounds { index, axis, len });
-        }
-        Ok(i as usize)
-    }
-
-    /// Index with one integer per leading axis. Returns the flat offset of
-    /// the addressed sub-array and its dims.
-    fn locate(&self, indices: &[isize]) -> Result<(usize, Dims)> {
-        if indices.len() > self.ndim() {
-            return Err(ArrayError::TooManyIndices { given: indices.len(), ndim: self.ndim() });
-        }
-        let mut offset = 0usize;
-        for (axis, &idx) in indices.iter().enumerate() {
-            let i = self.normalize_index(idx, axis)?;
-            offset += i * (self.dims.strides()[axis] as usize / 8);
-        }
-        Ok((offset, self.dims.drop_leading(indices.len())))
-    }
-
-    /// `a[i, j, ...]` with integers only. A full index returns a scalar
-    /// array (0-d); a partial one returns a copy of the sub-array.
-    pub fn index(&self, indices: &[isize]) -> Result<Array> {
-        let (offset, dims) = self.locate(indices)?;
-        let n = dims.size();
-        Ok(Array { data: self.data[offset..offset + n].to_vec(), dims })
-    }
-
-    /// Scalar element for a full integer index.
-    pub fn get(&self, indices: &[isize]) -> Result<Option<f64>> {
-        let (offset, dims) = self.locate(indices)?;
-        Ok(if dims.ndim() == 0 { Some(self.data[offset]) } else { None })
-    }
-
-    /// General basic indexing: one selector per leading axis, remaining axes
-    /// taken whole. Integer selectors drop their axis; slices keep it. The
-    /// result is a copy (views arrive in Phase 4).
-    pub fn select(&self, sels: &[Selector]) -> Result<Array> {
-        if sels.len() > self.ndim() {
-            return Err(ArrayError::TooManyIndices { given: sels.len(), ndim: self.ndim() });
-        }
-        let shape = self.shape();
-        // Per axis: (start, step, count) in elements of that axis.
-        let mut plan: Vec<(usize, isize, usize)> = Vec::with_capacity(self.ndim());
-        let mut out_shape: Vec<usize> = Vec::with_capacity(self.ndim());
-        for axis in 0..self.ndim() {
-            match sels.get(axis) {
-                Some(Selector::Int(i)) => {
-                    let i = self.normalize_index(*i, axis)?;
-                    plan.push((i, 1, 1));
-                }
-                Some(Selector::Slice { start, stop, step }) => {
-                    let count = if *step > 0 {
-                        if stop > start { ((stop - start - 1) / step + 1) as usize } else { 0 }
-                    } else if start > stop {
-                        ((start - stop - 1) / -step + 1) as usize
-                    } else {
-                        0
-                    };
-                    plan.push((*start as usize, *step, count));
-                    out_shape.push(count);
-                }
-                None => {
-                    plan.push((0, 1, shape[axis]));
-                    out_shape.push(shape[axis]);
-                }
-            }
-        }
-        let out_size: usize = out_shape.iter().product();
-        let mut out = Vec::with_capacity(out_size);
-        if out_size > 0 {
-            let elem_strides: Vec<usize> = self.dims.strides().iter().map(|&s| s as usize / 8).collect();
-            gather(&self.data, &plan, &elem_strides, 0, 0, &mut out);
-        }
-        Array::new(out, &out_shape)
-    }
-
-    /// Join arrays of equal ndim along `axis`; all other dimensions must match.
-    pub fn concatenate(parts: &[&Array], axis: isize) -> Result<Array> {
-        let first = parts.first().ok_or_else(|| ArrayError::Message("need at least one array to concatenate".into()))?;
-        let ndim = first.ndim() as isize;
-        if ndim == 0 {
-            return Err(ArrayError::Message("zero-dimensional arrays cannot be concatenated".into()));
-        }
-        if axis < -ndim || axis >= ndim {
-            return Err(ArrayError::Message(format!("axis {axis} is out of bounds for array of dimension {ndim}")));
-        }
-        let axis = if axis < 0 { (axis + ndim) as usize } else { axis as usize };
-        let mut out_shape = first.shape().to_vec();
-        out_shape[axis] = 0;
-        for p in parts {
-            if p.ndim() != first.ndim() {
-                return Err(ArrayError::Message("all the input arrays must have same number of dimensions".into()));
-            }
-            for (k, (&a, &b)) in p.shape().iter().zip(first.shape()).enumerate() {
-                if k != axis && a != b {
-                    return Err(ArrayError::Message(format!(
-                        "all the input array dimensions except for the concatenation axis must match exactly, but along dimension {k}, sizes {b} and {a} differ"
-                    )));
-                }
-            }
-            out_shape[axis] += p.shape()[axis];
-        }
-        let outer: usize = first.shape()[..axis].iter().product();
-        let inner: usize = first.shape()[axis + 1..].iter().product();
-        let mut data = Vec::with_capacity(out_shape.iter().product());
-        for o in 0..outer {
-            for p in parts {
-                let block = p.shape()[axis] * inner;
-                data.extend_from_slice(&p.data[o * block..(o + 1) * block]);
-            }
-        }
-        Array::new(data, &out_shape)
-    }
-
-    /// `where(cond, x, y)` with a boolean mask of the same shape.
-    pub fn select_where(cond: &[bool], x: &Array, y: &Array) -> Result<Array> {
-        if x.dims != y.dims || cond.len() != x.size() {
-            return Err(ArrayError::ShapeMismatch(x.shape().to_vec(), y.shape().to_vec()));
-        }
-        let data = cond.iter().zip(&x.data).zip(&y.data).map(|((&c, &a), &b)| if c { a } else { b }).collect();
-        Ok(Array { data, dims: x.dims })
-    }
-
-    /// Reverse the axes (NumPy's `.T`). 0-d and 1-d arrays are returned as
-    /// copies; 2-d is transposed directly; higher dims go through a general
-    /// permutation.
-    pub fn transpose(&self) -> Array {
-        match self.ndim() {
-            0 | 1 => self.clone(),
-            2 => {
-                let (rows, cols) = (self.shape()[0], self.shape()[1]);
-                let mut data = Vec::with_capacity(self.size());
-                for c in 0..cols {
-                    for r in 0..rows {
-                        data.push(self.data[r * cols + c]);
-                    }
-                }
-                Array { data, dims: Dims::from_shape(&[cols, rows]).expect("2-d") }
-            }
-            _ => {
-                let shape = self.shape();
-                let ndim = shape.len();
-                let rev_shape: Vec<usize> = shape.iter().rev().copied().collect();
-                let strides: Vec<usize> = self.dims.strides().iter().map(|&s| s as usize / 8).collect();
-                let mut data = Vec::with_capacity(self.size());
-                let mut idx = vec![0usize; ndim];
-                for _ in 0..self.size() {
-                    // idx is a multi-index into the transposed array; source offset uses reversed axes
-                    let off: usize = (0..ndim).map(|k| idx[k] * strides[ndim - 1 - k]).sum();
-                    data.push(self.data[off]);
-                    for k in (0..ndim).rev() {
-                        idx[k] += 1;
-                        if idx[k] < rev_shape[k] {
-                            break;
-                        }
-                        idx[k] = 0;
-                    }
-                }
-                Array { data, dims: Dims::from_shape(&rev_shape).expect("same ndim") }
-            }
-        }
-    }
-
-    /// `a[mask]` with a boolean mask over the whole array (mask shape equals
-    /// the array shape): the selected elements as a 1-D array.
-    pub fn compress_flat(&self, mask: &[bool]) -> Result<Array> {
-        if mask.len() != self.size() {
-            return Err(ArrayError::Message(format!(
-                "boolean index did not match indexed array; size {} but corresponding boolean size is {}",
-                self.size(),
-                mask.len()
-            )));
-        }
-        let data: Vec<f64> = self.data.iter().zip(mask).filter(|(_, &m)| m).map(|(&x, _)| x).collect();
-        let n = data.len();
-        Array::new(data, &[n])
-    }
-
-    /// `a[[i, j, ...]]`: rows along the leading axis, negative indices allowed.
-    pub fn take_leading(&self, indices: &[isize]) -> Result<Array> {
-        if self.ndim() == 0 {
-            return Err(ArrayError::TooManyIndices { given: 1, ndim: 0 });
-        }
-        let row = self.dims.drop_leading(1).size();
-        let mut data = Vec::with_capacity(indices.len() * row);
-        for &i in indices {
-            let i = self.normalize_index(i, 0)?;
-            data.extend_from_slice(&self.data[i * row..(i + 1) * row]);
-        }
-        let mut shape = vec![indices.len()];
-        shape.extend_from_slice(&self.shape()[1..]);
-        Array::new(data, &shape)
-    }
 
     /// Sorted copy of a 1-D array, NaN last like NumPy.
     pub fn sorted_1d(&self) -> Result<Array> {
@@ -619,9 +674,251 @@ impl Array {
         Ok(Array { data, dims: self.dims })
     }
 
-    pub fn reshape(&self, shape: &[usize]) -> Result<Array> {
-        Array::new(self.data.clone(), shape)
+}
+
+// ---- dtype-erased array -----------------------------------------------------
+
+/// A scalar of any supported dtype.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scalar {
+    F(f64),
+    I(i64),
+    B(bool),
+}
+
+impl Scalar {
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Scalar::F(v) => v,
+            Scalar::I(v) => v as f64,
+            Scalar::B(v) => v as u8 as f64,
+        }
     }
+}
+
+/// An array of one of the supported dtypes. float64 is the fast path with
+/// the full kernel set; int64 and bool have the structural operations plus
+/// the few kernels that matter for them (comparisons, masks, counts, index
+/// arrays) and promote to float64 for arithmetic with floats.
+#[derive(Clone, Debug)]
+pub enum AnyArray {
+    F64(Array<f64>),
+    I64(Array<i64>),
+    Bool(Array<bool>),
+}
+
+macro_rules! each {
+    ($any:expr, $a:ident => $body:expr) => {
+        match $any {
+            AnyArray::F64($a) => $body,
+            AnyArray::I64($a) => $body,
+            AnyArray::Bool($a) => $body,
+        }
+    };
+}
+
+macro_rules! map_each {
+    ($any:expr, $a:ident => $body:expr) => {
+        match $any {
+            AnyArray::F64($a) => AnyArray::F64($body),
+            AnyArray::I64($a) => AnyArray::I64($body),
+            AnyArray::Bool($a) => AnyArray::Bool($body),
+        }
+    };
+}
+
+impl AnyArray {
+    pub fn dims(&self) -> &Dims {
+        each!(self, a => &a.dims)
+    }
+    pub fn shape(&self) -> &[usize] {
+        self.dims().shape()
+    }
+    pub fn ndim(&self) -> usize {
+        self.dims().ndim()
+    }
+    pub fn size(&self) -> usize {
+        each!(self, a => a.data.len())
+    }
+    pub fn itemsize(&self) -> usize {
+        self.dims().itemsize()
+    }
+    /// NumPy dtype name.
+    pub fn dtype_name(&self) -> &'static str {
+        match self {
+            AnyArray::F64(_) => "float64",
+            AnyArray::I64(_) => "int64",
+            AnyArray::Bool(_) => "bool",
+        }
+    }
+    /// Buffer-protocol format character.
+    pub fn format(&self) -> &'static std::ffi::CStr {
+        match self {
+            AnyArray::F64(_) => c"d",
+            // NumPy's default integer is C long where that is 8 bytes; using
+            // its format code keeps reprs free of a spurious `dtype=int64`.
+            AnyArray::I64(_) => {
+                if std::mem::size_of::<std::ffi::c_long>() == 8 {
+                    c"l"
+                } else {
+                    c"q"
+                }
+            }
+            AnyArray::Bool(_) => c"?",
+        }
+    }
+    pub fn data_ptr(&self) -> *const std::ffi::c_void {
+        each!(self, a => a.data.as_ptr() as *const std::ffi::c_void)
+    }
+    pub fn as_f64(&self) -> Option<&Array<f64>> {
+        match self {
+            AnyArray::F64(a) => Some(a),
+            _ => None,
+        }
+    }
+    pub fn as_f64_mut(&mut self) -> Option<&mut Array<f64>> {
+        match self {
+            AnyArray::F64(a) => Some(a),
+            _ => None,
+        }
+    }
+    pub fn as_bool(&self) -> Option<&Array<bool>> {
+        match self {
+            AnyArray::Bool(a) => Some(a),
+            _ => None,
+        }
+    }
+    pub fn as_i64(&self) -> Option<&Array<i64>> {
+        match self {
+            AnyArray::I64(a) => Some(a),
+            _ => None,
+        }
+    }
+    /// Promote to float64 (a copy for int64/bool, a clone for float64).
+    pub fn to_f64(&self) -> Array<f64> {
+        match self {
+            AnyArray::F64(a) => a.clone(),
+            AnyArray::I64(a) => Array { data: a.data.iter().map(|&v| v as f64).collect(), dims: a.dims.retyped(8) },
+            AnyArray::Bool(a) => Array { data: a.data.iter().map(|&v| v as u8 as f64).collect(), dims: a.dims.retyped(8) },
+        }
+    }
+    /// Promote bool to int64; None for float64.
+    pub fn to_i64(&self) -> Option<Array<i64>> {
+        match self {
+            AnyArray::F64(_) => None,
+            AnyArray::I64(a) => Some(a.clone()),
+            AnyArray::Bool(a) => Some(Array { data: a.data.iter().map(|&v| v as i64).collect(), dims: a.dims.retyped(8) }),
+        }
+    }
+    pub fn index(&self, indices: &[isize]) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.index(indices)?))
+    }
+    /// Scalar element for a full integer index.
+    pub fn get(&self, indices: &[isize]) -> Result<Option<Scalar>> {
+        Ok(match self {
+            AnyArray::F64(a) => a.get(indices)?.map(Scalar::F),
+            AnyArray::I64(a) => a.get(indices)?.map(Scalar::I),
+            AnyArray::Bool(a) => a.get(indices)?.map(Scalar::B),
+        })
+    }
+    /// The single element of a size-1 array.
+    pub fn item(&self) -> Option<Scalar> {
+        if self.size() != 1 {
+            return None;
+        }
+        Some(match self {
+            AnyArray::F64(a) => Scalar::F(a.data[0]),
+            AnyArray::I64(a) => Scalar::I(a.data[0]),
+            AnyArray::Bool(a) => Scalar::B(a.data[0]),
+        })
+    }
+    pub fn select(&self, sels: &[Selector]) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.select(sels)?))
+    }
+    pub fn reshape(&self, shape: &[usize]) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.reshape(shape)?))
+    }
+    pub fn transpose(&self) -> AnyArray {
+        map_each!(self, a => a.transpose())
+    }
+    pub fn take_leading(&self, indices: &[isize]) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.take_leading(indices)?))
+    }
+    pub fn compress_flat(&self, mask: &[bool]) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.compress_flat(mask)?))
+    }
+    /// Concatenate arrays of one dtype; None when the dtypes differ.
+    pub fn concatenate(parts: &[&AnyArray], axis: isize) -> Result<Option<AnyArray>> {
+        macro_rules! same {
+            ($variant:ident) => {{
+                let mut refs = Vec::with_capacity(parts.len());
+                for p in parts {
+                    match p {
+                        AnyArray::$variant(a) => refs.push(a),
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(AnyArray::$variant(Array::concatenate(&refs, axis)?)))
+            }};
+        }
+        match parts.first() {
+            None => Err(ArrayError::Message("need at least one array to concatenate".into())),
+            Some(AnyArray::F64(_)) => same!(F64),
+            Some(AnyArray::I64(_)) => same!(I64),
+            Some(AnyArray::Bool(_)) => same!(Bool),
+        }
+    }
+}
+
+impl Array<bool> {
+    pub fn count(&self) -> usize {
+        self.data.iter().filter(|&&b| b).count()
+    }
+    pub fn not(&self) -> Array<bool> {
+        Array { data: self.data.iter().map(|&b| !b).collect(), dims: self.dims }
+    }
+    /// Element-wise combination of two equal-shape masks.
+    pub fn zip_bool<F: Fn(bool, bool) -> bool>(&self, other: &Array<bool>, f: F) -> Option<Array<bool>> {
+        if self.dims != other.dims {
+            return None;
+        }
+        Some(Array { data: self.data.iter().zip(&other.data).map(|(&a, &b)| f(a, b)).collect(), dims: self.dims })
+    }
+}
+
+impl Array<i64> {
+    pub fn sum(&self) -> i64 {
+        self.data.iter().fold(0i64, |acc, &v| acc.wrapping_add(v))
+    }
+    pub fn min(&self) -> Option<i64> {
+        self.data.iter().copied().min()
+    }
+    pub fn max(&self) -> Option<i64> {
+        self.data.iter().copied().max()
+    }
+    /// Equal-shape element-wise op; None when shapes differ (caller falls back).
+    pub fn zip_int<F: Fn(i64, i64) -> i64>(&self, other: &Array<i64>, f: F) -> Option<Array<i64>> {
+        if self.dims != other.dims {
+            return None;
+        }
+        Some(Array { data: self.data.iter().zip(&other.data).map(|(&a, &b)| f(a, b)).collect(), dims: self.dims })
+    }
+    pub fn map_int<F: Fn(i64) -> i64>(&self, f: F) -> Array<i64> {
+        Array { data: self.data.iter().map(|&a| f(a)).collect(), dims: self.dims }
+    }
+}
+
+/// Equal-shape comparison producing a mask; None when shapes differ.
+pub fn compare<T: Element, F: Fn(T, T) -> bool>(a: &Array<T>, b: &Array<T>, f: F) -> Option<Array<bool>> {
+    if a.shape() != b.shape() {
+        return None;
+    }
+    Some(Array { data: a.data.iter().zip(&b.data).map(|(&x, &y)| f(x, y)).collect(), dims: a.dims.retyped(1) })
+}
+
+/// Comparison against a scalar.
+pub fn compare_scalar<T: Element, F: Fn(T) -> bool>(a: &Array<T>, f: F) -> Array<bool> {
+    Array { data: a.data.iter().map(|&x| f(x)).collect(), dims: a.dims.retyped(1) }
 }
 
 /// One axis of a basic index: an integer or a slice already resolved with
@@ -632,7 +929,7 @@ pub enum Selector {
     Slice { start: isize, stop: isize, step: isize },
 }
 
-fn gather(data: &[f64], plan: &[(usize, isize, usize)], strides: &[usize], axis: usize, offset: usize, out: &mut Vec<f64>) {
+fn gather<T: Copy>(data: &[T], plan: &[(usize, isize, usize)], strides: &[usize], axis: usize, offset: usize, out: &mut Vec<T>) {
     let (start, step, count) = plan[axis];
     let last = axis + 1 == plan.len();
     let mut pos = start as isize;
@@ -647,7 +944,7 @@ fn gather(data: &[f64], plan: &[(usize, isize, usize)], strides: &[usize], axis:
     }
 }
 
-impl fmt::Debug for Array {
+impl<T: Element> fmt::Debug for Array<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Array").field("shape", &self.shape()).field("data", &self.data).finish()
     }
@@ -697,7 +994,7 @@ mod tests {
     fn max_propagates_nan_and_handles_empty() {
         let a = Array::new(vec![1.0, f64::NAN, 3.0], &[3]).unwrap();
         assert!(a.max().unwrap().is_nan());
-        assert_eq!(Array::new(vec![], &[0]).unwrap().max(), None);
+        assert_eq!(Array::<f64>::new(vec![], &[0]).unwrap().max(), None);
     }
 
     #[test]
@@ -794,6 +1091,26 @@ mod tests {
         let b = Array::new(vec![9.0, 9.0], &[2, 1]).unwrap();
         assert_eq!(Array::concatenate(&[&a, &b], 1).unwrap().data()[3], 9.0);
         assert!(Array::concatenate(&[&a, &b], 0).is_err());
+    }
+
+    #[test]
+    fn any_array_structure_and_promotion() {
+        let i = AnyArray::I64(Array::new(vec![1i64, 2, 3, 4, 5, 6], &[2, 3]).unwrap());
+        assert_eq!((i.dtype_name(), i.itemsize(), i.shape()), ("int64", 8, &[2, 3][..]));
+        assert_eq!(i.get(&[1, -1]).unwrap(), Some(Scalar::I(6)));
+        assert_eq!(i.transpose().shape(), &[3, 2]);
+        assert_eq!(i.to_f64().data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = AnyArray::Bool(Array::new(vec![true, false, true], &[3]).unwrap());
+        assert_eq!((b.dtype_name(), b.itemsize()), ("bool", 1));
+        assert_eq!(b.dims().strides(), &[1]);
+        assert_eq!(b.as_bool().unwrap().count(), 2);
+        assert_eq!(b.to_i64().unwrap().data(), &[1, 0, 1]);
+        assert!(AnyArray::concatenate(&[&i, &b], 0).unwrap().is_none());
+        let f = Array::new(vec![1.0, 5.0, 3.0], &[3]).unwrap();
+        let m = compare_scalar(&f, |x| x > 2.0);
+        assert_eq!(m.data(), &[false, true, true]);
+        assert_eq!(f.compress_flat(m.data()).unwrap().data(), &[5.0, 3.0]);
+        assert_eq!(compare(&f, &f, |x, y| x == y).unwrap().count(), 3);
     }
 
     #[test]

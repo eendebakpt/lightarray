@@ -38,11 +38,13 @@ def _like(name, a, dtype, order, subok, shape, device, fill=None):
     float64 array; NumPy input keeps NumPy's dtype inference."""
     if device not in (None, "cpu"):
         raise ValueError(f"Unsupported device {device!r}: lightarray arrays live on the CPU")
-    native = isinstance(a, ndarray) and order in (None, "K", "C", "A") and subok in (True, False) and shape is None
+    native = (
+        isinstance(a, ndarray) and a.dtype == _np.float64 and order in (None, "K", "C", "A") and subok in (True, False) and shape is None
+    )
     if native:
         s = a.shape
         if name == "full_like":
-            return full(s, fill, dtype=dtype)  # noqa: F405
+            return full(s, fill, dtype=dtype if dtype is not None else a.dtype)  # noqa: F405
         return globals()[name[: -len("_like")]](s, dtype=dtype)
     kwargs = {"dtype": dtype, "order": order or "K", "subok": subok, "shape": shape}
     if name == "full_like":
@@ -104,7 +106,9 @@ def _as_index(obj):
     an int64 array (lightarray has no integer dtype yet)."""
     if isinstance(obj, ndarray):
         v = _np.asarray(obj)
-        if v.size == 0 or (v == _np.floor(v)).all():
+        # float64 arrays holding whole numbers are meant as indices; int64 and
+        # bool arrays (index arrays, masks) are passed through as they are
+        if v.dtype.kind == "f" and (v.size == 0 or (v == _np.floor(v)).all()):
             return v.astype(_np.int64)
         return v
     if type(obj) is tuple:
@@ -205,7 +209,12 @@ def expand_dims(a, axis):
         return _fallback.call("expand_dims", a, axis)
     axes = (axis,) if isinstance(axis, int) else tuple(axis)
     out_ndim = a.ndim + len(axes)
+    for ax in axes:
+        if not -out_ndim <= ax < out_ndim:
+            raise _np.exceptions.AxisError(ax, out_ndim)
     axes = sorted(ax + out_ndim if ax < 0 else ax for ax in axes)
+    if len(set(axes)) != len(axes):
+        raise ValueError("repeated axis")
     shape, it = [], iter(a.shape)
     for i in range(out_ndim):
         shape.append(1 if i in axes else next(it))
@@ -240,7 +249,7 @@ def diff(a, n=1, axis=-1, prepend=None, append=None):
 def count_nonzero(a, axis=None, *, keepdims=False):
     a = asarray(a)  # noqa: F405
     if axis is None and not keepdims and isinstance(a, ndarray):
-        return int((a != 0).sum())
+        return _np.intp((a != 0).sum())
     return _fallback.call("count_nonzero", a, axis=axis, keepdims=keepdims)
 
 

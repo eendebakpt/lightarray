@@ -5,7 +5,7 @@
 //! (writable, like a NumPy view). The capsule keeps the Python array alive
 //! until the consumer calls the deleter.
 
-use crate::dims::ITEMSIZE;
+use crate::array::AnyArray;
 use crate::python::PyArray;
 use pyo3::exceptions::PyBufferError;
 use pyo3::ffi;
@@ -13,7 +13,9 @@ use pyo3::prelude::*;
 use std::ffi::{c_char, c_void};
 
 const K_DL_CPU: i32 = 1;
+const K_DL_INT: u8 = 0;
 const K_DL_FLOAT: u8 = 2;
+const K_DL_BOOL: u8 = 6;
 const CAPSULE_NAME: &std::ffi::CStr = c"dltensor_versioned";
 
 #[repr(C)]
@@ -55,6 +57,14 @@ struct DLManagedTensorVersioned {
     dl_tensor: DLTensor,
 }
 
+fn dl_dtype(array: &AnyArray) -> DLDataType {
+    match array {
+        AnyArray::F64(_) => DLDataType { code: K_DL_FLOAT, bits: 64, lanes: 1 },
+        AnyArray::I64(_) => DLDataType { code: K_DL_INT, bits: 64, lanes: 1 },
+        AnyArray::Bool(_) => DLDataType { code: K_DL_BOOL, bits: 8, lanes: 1 },
+    }
+}
+
 /// Everything the consumer's pointer must keep alive, in one allocation.
 /// The managed tensor is the first field so a pointer to it is a pointer to
 /// the container.
@@ -93,13 +103,13 @@ unsafe extern "C" fn capsule_destructor(capsule: *mut ffi::PyObject) {
 /// Build the capsule for `array`.
 pub fn export(array: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
     let py = array.py();
-    let inner = &array.get().inner();
+    let inner = array.get().arr();
     let ndim = inner.ndim();
     let mut shape = [0i64; crate::dims::MAX_NDIM];
     let mut strides = [0i64; crate::dims::MAX_NDIM];
     for (k, &d) in inner.shape().iter().enumerate() {
         shape[k] = d as i64;
-        strides[k] = (inner.dims.strides()[k] / ITEMSIZE) as i64; // DLPack strides are in elements
+        strides[k] = inner.dims().elem_stride(k) as i64; // DLPack strides are in elements
     }
     let mut export = Box::new(Export {
         managed: DLManagedTensorVersioned {
@@ -108,10 +118,10 @@ pub fn export(array: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
             deleter: Some(deleter),
             flags: 0,
             dl_tensor: DLTensor {
-                data: inner.data().as_ptr() as *mut c_void,
+                data: inner.data_ptr() as *mut c_void,
                 device: DLDevice { device_type: K_DL_CPU, device_id: 0 },
                 ndim: ndim as i32,
-                dtype: DLDataType { code: K_DL_FLOAT, bits: 64, lanes: 1 },
+                dtype: dl_dtype(inner),
                 shape: std::ptr::null_mut(),
                 strides: std::ptr::null_mut(),
                 byte_offset: 0,
@@ -178,21 +188,21 @@ unsafe extern "C" fn legacy_capsule_destructor(capsule: *mut ffi::PyObject) {
 
 pub fn export_legacy(array: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
     let py = array.py();
-    let inner = array.get().inner();
+    let inner = array.get().arr();
     let ndim = inner.ndim();
     let mut shape = [0i64; crate::dims::MAX_NDIM];
     let mut strides = [0i64; crate::dims::MAX_NDIM];
     for (k, &d) in inner.shape().iter().enumerate() {
         shape[k] = d as i64;
-        strides[k] = (inner.dims.strides()[k] / ITEMSIZE) as i64;
+        strides[k] = inner.dims().elem_stride(k) as i64;
     }
     let mut export = Box::new(LegacyExport {
         managed: DLManagedTensor {
             dl_tensor: DLTensor {
-                data: inner.data().as_ptr() as *mut c_void,
+                data: inner.data_ptr() as *mut c_void,
                 device: DLDevice { device_type: K_DL_CPU, device_id: 0 },
                 ndim: ndim as i32,
-                dtype: DLDataType { code: K_DL_FLOAT, bits: 64, lanes: 1 },
+                dtype: dl_dtype(inner),
                 shape: std::ptr::null_mut(),
                 strides: std::ptr::null_mut(),
                 byte_offset: 0,

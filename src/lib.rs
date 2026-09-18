@@ -16,7 +16,8 @@ pub use dims::{Dims, MAX_NDIM};
 pub use dtype::DType;
 pub use python::PyArray;
 
-use python::{array_from_any, array_or_numpy, binary_native, bool_array, bool_mask, extract_shape, fallback, np_bool, where_native};
+use array::{compare_scalar, AnyArray};
+use python::{any_of, array_from_any, array_or_numpy, binary_native, bool_mask, extract_shape, f64_of, fallback, np_bool, where_native};
 
 /// No-op used only to measure raw PyO3 call overhead in benchmarks.
 #[pyfunction]
@@ -101,7 +102,12 @@ fn asarray(py: Python<'_>, object: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, P
     if called_from_dunder_array(py) {
         return numpy_array(py, object, dtype);
     }
-    if object.is_instance_of::<PyArray>() && is_float64_or_none(py, dtype)? {
+    let passthrough = match any_of(object) {
+        Some(AnyArray::F64(_)) => is_float64_or_none(py, dtype)?,
+        Some(_) => dtype.map_or(true, |d| d.is_none()),
+        None => false,
+    };
+    if passthrough {
         return match copy {
             Some(true) => object.call_method0("copy").map(|r| r.unbind()),
             _ => Ok(object.clone().unbind()),
@@ -223,44 +229,78 @@ fn empty(py: Python<'_>, shape: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, PyAn
 fn full(py: Python<'_>, shape: &Bound<'_, PyAny>, fill_value: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, PyAny>>, order: Option<&Bound<'_, PyAny>>, device: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
     check_device(device)?;
     let _ = order;
-    let is_bool = fill_value.is_instance_of::<pyo3::types::PyBool>();
-    let scalar = if !is_bool && (fill_value.is_instance_of::<PyFloat>() || fill_value.is_instance_of::<pyo3::types::PyInt>()) {
-        fill_value.extract::<f64>().ok()
-    } else {
-        None
-    };
     let too_many_dims = shape.len().map_or(false, |n| n > MAX_NDIM);
-    match scalar {
-        Some(v) if !too_many_dims && is_float64_or_none(py, dtype)? => PyArray::new(Array::filled(&extract_shape(shape)?, v)?).into_py(py),
-        _ => {
-            let kw = PyDict::new(py);
-            kw.set_item("dtype", dtype)?;
-            fallback(py, "call", ("full", shape.clone(), fill_value.clone()), Some(&kw))
+    let no_dtype = dtype.map_or(true, |d| d.is_none());
+    if !too_many_dims && !called_from_dunder_array(py) {
+        let dims = extract_shape(shape)?;
+        if fill_value.is_instance_of::<pyo3::types::PyBool>() {
+            if no_dtype {
+                return PyArray::from_any(AnyArray::Bool(Array::filled(&dims, fill_value.is_truthy()?)?)).into_py(py);
+            }
+        } else if fill_value.is_instance_of::<pyo3::types::PyInt>() {
+            if no_dtype {
+                if let Ok(v) = fill_value.extract::<i64>() {
+                    return PyArray::from_any(AnyArray::I64(Array::filled(&dims, v)?)).into_py(py);
+                }
+            } else if is_float64_or_none(py, dtype)? {
+                return PyArray::new(Array::filled(&dims, fill_value.extract::<f64>()?)?).into_py(py);
+            }
+        } else if fill_value.is_instance_of::<PyFloat>() && is_float64_or_none(py, dtype)? {
+            return PyArray::new(Array::filled(&dims, fill_value.extract::<f64>()?)?).into_py(py);
         }
     }
+    let kw = PyDict::new(py);
+    kw.set_item("dtype", dtype)?;
+    fallback(py, "call", ("full", shape.clone(), fill_value.clone()), Some(&kw))
 }
 
 /// `arange([start,] stop[, step])`. Always float64 (NumPy would give int64
 /// for integer arguments; that changes when integer dtypes arrive).
 #[pyfunction]
-#[pyo3(signature = (start, stop=None, step=1.0, dtype=None, *, device=None), text_signature = "(start, stop=None, step=1, dtype=None, *, device=None, like=None)")]
-fn arange(py: Python<'_>, start: f64, stop: Option<f64>, step: f64, dtype: Option<&Bound<'_, PyAny>>, device: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (start, stop=None, step=None, dtype=None, *, device=None), text_signature = "(start, stop=None, step=1, dtype=None, *, device=None, like=None)")]
+fn arange(py: Python<'_>, start: &Bound<'_, PyAny>, stop: Option<&Bound<'_, PyAny>>, step: Option<&Bound<'_, PyAny>>, dtype: Option<&Bound<'_, PyAny>>, device: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
     check_device(device)?;
-    let (start, stop) = match stop {
-        Some(s) => (start, s),
-        None => (0.0, start),
-    };
-    if called_from_dunder_array(py) || !is_float64_or_none(py, dtype)? {
-        let kw = PyDict::new(py);
-        kw.set_item("dtype", dtype)?;
-        return fallback(py, "call", ("arange", start, stop, step), Some(&kw));
+    let stop = stop.filter(|s| !s.is_none());
+    let step = step.filter(|s| !s.is_none());
+    let is_int = |v: &Bound<'_, PyAny>| v.is_instance_of::<pyo3::types::PyInt>() && !v.is_instance_of::<pyo3::types::PyBool>();
+    let no_dtype = dtype.map_or(true, |d| d.is_none());
+    let plain = !called_from_dunder_array(py);
+    if plain && no_dtype && is_int(start) && stop.map_or(true, is_int) && step.map_or(true, is_int) {
+        let (a, b) = match stop {
+            Some(s) => (start.extract::<i64>()?, s.extract::<i64>()?),
+            None => (0, start.extract::<i64>()?),
+        };
+        let st = step.map_or(Ok(1), |s| s.extract::<i64>())?;
+        if st == 0 {
+            return Err(pyo3::exceptions::PyZeroDivisionError::new_err("division by zero"));
+        }
+        let n = if (st > 0 && b > a) || (st < 0 && b < a) { ((b - a).abs() as u64).div_ceil(st.unsigned_abs()) as usize } else { 0 };
+        let data: Vec<i64> = (0..n as i64).map(|i| a + i * st).collect();
+        return PyArray::from_any(AnyArray::I64(Array::new(data, &[n])?)).into_py(py);
     }
-    if step == 0.0 {
-        return Err(pyo3::exceptions::PyZeroDivisionError::new_err("division by zero"));
+    let as_f64 = |v: &Bound<'_, PyAny>| v.extract::<f64>();
+    let numeric = as_f64(start).is_ok() && stop.map_or(true, |s| as_f64(s).is_ok()) && step.map_or(true, |s| as_f64(s).is_ok());
+    if plain && numeric && is_float64_or_none(py, dtype)? {
+        let (a, b) = match stop {
+            Some(s) => (as_f64(start)?, as_f64(s)?),
+            None => (0.0, as_f64(start)?),
+        };
+        let st = step.map_or(Ok(1.0), as_f64)?;
+        if st == 0.0 {
+            return Err(pyo3::exceptions::PyZeroDivisionError::new_err("division by zero"));
+        }
+        let n = ((b - a) / st).ceil().max(0.0) as usize;
+        let data: Vec<f64> = (0..n).map(|i| a + i as f64 * st).collect();
+        return PyArray::new(Array::new(data, &[n])?).into_py(py);
     }
-    let n = ((stop - start) / step).ceil().max(0.0) as usize;
-    let data: Vec<f64> = (0..n).map(|i| start + i as f64 * step).collect();
-    PyArray::new(Array::new(data, &[n])?).into_py(py)
+    let kw = PyDict::new(py);
+    kw.set_item("dtype", dtype)?;
+    match (stop, step) {
+        (Some(s), Some(t)) => fallback(py, "call", ("arange", start.clone(), s.clone(), t.clone()), Some(&kw)),
+        (Some(s), None) => fallback(py, "call", ("arange", start.clone(), s.clone()), Some(&kw)),
+        (None, Some(t)) => fallback(py, "call", ("arange", 0, start.clone(), t.clone()), Some(&kw)),
+        (None, None) => fallback(py, "call", ("arange", start.clone()), Some(&kw)),
+    }
 }
 
 /// `linspace(start, stop, num=50, endpoint=True)`. `retstep`, `axis` and
@@ -299,8 +339,18 @@ fn linspace(py: Python<'_>, start: &Bound<'_, PyAny>, stop: &Bound<'_, PyAny>, n
 /// Apply `f` to an array natively, a Python number as a float, and anything
 /// else through NumPy.
 fn unary(py: Python<'_>, name: &str, x: &Bound<'_, PyAny>, f: fn(f64) -> f64) -> PyResult<Py<PyAny>> {
-    if let Ok(a) = x.cast::<PyArray>() {
-        return PyArray::new(a.get().inner().map(f)).into_py(py);
+    if let Some(a) = f64_of(x) {
+        return PyArray::new(a.map(f)).into_py(py);
+    }
+    if let Some(any) = any_of(x) {
+        // int64/bool input: NumPy keeps the integer dtype for these, and
+        // computes in float64 for the rest (sin, exp, sqrt, ...)
+        const KEEPS_INT: [&str; 12] = ["floor", "ceil", "trunc", "rint", "negative", "positive", "absolute", "abs", "sign", "square", "reciprocal", "fabs"];
+        // (bool input gives float16 in NumPy, so that goes to NumPy too)
+        if KEEPS_INT.contains(&name) || matches!(any, AnyArray::Bool(_)) {
+            return fallback(py, "call", (name, x.clone()), None);
+        }
+        return PyArray::new(any.to_f64().map(f)).into_py(py);
     }
     if x.is_instance_of::<pyo3::types::PyFloat>() || x.is_instance_of::<pyo3::types::PyInt>() {
         return Ok(f(x.extract()?).into_pyobject(py)?.into_any().unbind());
@@ -345,14 +395,12 @@ unary_functions! {
 macro_rules! predicate_functions {
     ($( $name:ident => $f:expr ),* $(,)?) => {
         $(
-            #[doc = concat!("Element-wise `", stringify!($name), "` with NumPy semantics: native for lightarray arrays (returns a NumPy bool array) and Python numbers (returns bool), NumPy otherwise.")]
+            #[doc = concat!("Element-wise `", stringify!($name), "` with NumPy semantics: native for float64 lightarray arrays (returns a bool lightarray) and Python numbers (returns np.bool_), NumPy otherwise.")]
             #[pyfunction]
             fn $name(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
                 let f: fn(f64) -> bool = $f;
-                if let Ok(a) = x.cast::<PyArray>() {
-                    let inner = a.get().inner();
-                    let bytes: Vec<u8> = inner.data().iter().map(|&v| f(v) as u8).collect();
-                    return bool_array(py, bytes, inner.shape());
+                if let Some(a) = f64_of(x) {
+                    return PyArray::from_any(AnyArray::Bool(compare_scalar(a, f))).into_py(py);
                 }
                 if x.is_instance_of::<PyFloat>() || x.is_instance_of::<pyo3::types::PyInt>() {
                     // NumPy returns np.bool_ for scalars; `~np.isfinite(v)` relies on it.
@@ -508,7 +556,10 @@ binary_math_functions! {
     minimum => |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) },
     fmax => f64::max, fmin => f64::min,
     arctan2 => f64::atan2, hypot => f64::hypot, copysign => f64::copysign,
-    logaddexp => |a: f64, b: f64| { let m = a.max(b); if m == f64::NEG_INFINITY { m } else { m + ((a - m).exp() + (b - m).exp()).ln() } },
+    logaddexp => |a: f64, b: f64| {
+        let m = a.max(b);
+        if a.is_nan() || b.is_nan() { f64::NAN } else if m.is_infinite() { m } else { m + ((a - m).exp() + (b - m).exp()).ln() }
+    },
 }
 
 /// `concatenate(arrays, axis=0)` natively for lightarray inputs; anything
@@ -524,8 +575,10 @@ fn concatenate(py: Python<'_>, arrays: &Bound<'_, PyAny>, axis: Option<&Bound<'_
                 Err(_) => Vec::new(),
             };
             if !parts.is_empty() && parts.len() == items.len() {
-                let refs: Vec<&Array> = parts.iter().map(|p| p.inner()).collect();
-                return PyArray::new(Array::concatenate(&refs, ax)?).into_py(py);
+                let refs: Vec<&AnyArray> = parts.iter().map(|p| p.arr()).collect();
+                if let Some(joined) = AnyArray::concatenate(&refs, ax)? {
+                    return PyArray::from_any(joined).into_py(py);
+                }
             }
         }
     }
@@ -545,15 +598,17 @@ fn stack(py: Python<'_>, arrays: &Bound<'_, PyAny>, axis: Option<&Bound<'_, PyAn
                 Ok(p) => p,
                 Err(_) => Vec::new(),
             };
-            if !parts.is_empty() && parts.len() == items.len() && parts.iter().all(|p| p.inner().shape() == parts[0].inner().shape()) {
-                let ndim = parts[0].inner().ndim() as isize + 1;
+            if !parts.is_empty() && parts.len() == items.len() && parts.iter().all(|p| p.arr().shape() == parts[0].arr().shape()) {
+                let ndim = parts[0].arr().ndim() as isize + 1;
                 if ax >= -ndim && ax < ndim {
                     let ax = if ax < 0 { (ax + ndim) as usize } else { ax as usize };
-                    let mut shape = parts[0].inner().shape().to_vec();
+                    let mut shape = parts[0].arr().shape().to_vec();
                     shape.insert(ax, 1);
-                    let expanded: Vec<Array> = parts.iter().map(|p| p.inner().reshape(&shape)).collect::<Result<_, _>>()?;
-                    let refs: Vec<&Array> = expanded.iter().collect();
-                    return PyArray::new(Array::concatenate(&refs, ax as isize)?).into_py(py);
+                    let expanded: Vec<AnyArray> = parts.iter().map(|p| p.arr().reshape(&shape)).collect::<Result<_, _>>()?;
+                    let refs: Vec<&AnyArray> = expanded.iter().collect();
+                    if let Some(joined) = AnyArray::concatenate(&refs, ax as isize)? {
+                        return PyArray::from_any(joined).into_py(py);
+                    }
                 }
             }
         }
@@ -581,33 +636,19 @@ fn isclose(py: Python<'_>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>, rtol: f64
     let scalar = |v: &Bound<'_, PyAny>| -> Option<f64> {
         if v.is_instance_of::<PyFloat>() || v.is_instance_of::<pyo3::types::PyInt>() { v.extract::<f64>().ok() } else { None }
     };
-    match (a.cast::<PyArray>().ok(), b.cast::<PyArray>().ok()) {
-        (Some(x), Some(y)) => {
-            let (x, y) = (x.get().inner(), y.get().inner());
-            if x.shape() == y.shape() {
-                let bytes: Vec<u8> = x.data().iter().zip(y.data()).map(|(&p, &q)| close(p, q) as u8).collect();
-                return bool_array(py, bytes, x.shape());
-            }
-        }
-        (Some(x), None) => {
-            if let Some(v) = scalar(b) {
-                let x = x.get().inner();
-                let bytes: Vec<u8> = x.data().iter().map(|&p| close(p, v) as u8).collect();
-                return bool_array(py, bytes, x.shape());
-            }
-        }
-        (None, Some(y)) => {
-            if let Some(v) = scalar(a) {
-                let y = y.get().inner();
-                let bytes: Vec<u8> = y.data().iter().map(|&q| close(v, q) as u8).collect();
-                return bool_array(py, bytes, y.shape());
-            }
-        }
+    let mask = match (f64_of(a), f64_of(b)) {
+        (Some(x), Some(y)) => array::compare(x, y, close),
+        (Some(x), None) => scalar(b).map(|v| compare_scalar(x, |p| close(p, v))),
+        (None, Some(y)) => scalar(a).map(|v| compare_scalar(y, |q| close(v, q))),
         (None, None) => {
             if let (Some(p), Some(q)) = (scalar(a), scalar(b)) {
                 return np_bool(py, close(p, q));
             }
+            None
         }
+    };
+    if let Some(mask) = mask {
+        return PyArray::from_any(AnyArray::Bool(mask)).into_py(py);
     }
     let kw = PyDict::new(py);
     kw.set_item("rtol", rtol)?;
@@ -646,8 +687,7 @@ fn sort<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>,
         }
     }
     let plain = kw.as_ref().map_or(true, |k| k.is_empty());
-    if let Ok(arr) = a.cast::<PyArray>() {
-        let inner = arr.get().inner();
+    if let Some(inner) = f64_of(a) {
         let axis_ok = args.is_empty() || (args.len() == 1 && args.get_item(0)?.extract::<isize>().map_or(false, |ax| ax == -1 || ax == 0));
         if inner.ndim() == 1 && axis_ok && plain {
             let mut sorted = inner.sorted_1d()?;

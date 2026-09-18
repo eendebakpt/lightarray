@@ -48,6 +48,8 @@ def _args_to_numpy(args):
 
 
 _FLOAT64_NUM = np.dtype("float64").num
+#: dtypes lightarray stores natively; NumPy results of these come back as lightarray
+_NATIVE_NUMS = frozenset({np.dtype("float64").num, np.dtype("int64").num, np.dtype("bool").num})
 
 
 #: Set by lightarray.patch_module while any package is patched: then results
@@ -69,10 +71,10 @@ def _inside_dunder_array():
 
 
 def from_numpy(obj):
-    """float64 ndarray -> lightarray; other objects are returned unchanged."""
+    """float64, int64 and bool ndarrays -> lightarray; other objects are returned unchanged."""
     t = type(obj)
     if t is np.ndarray:
-        if obj.dtype.num == _FLOAT64_NUM and obj.ndim <= _core.MAX_NDIM and not (patch_active and _inside_dunder_array()):
+        if obj.dtype.num in _NATIVE_NUMS and obj.ndim <= _core.MAX_NDIM and not (patch_active and _inside_dunder_array()):
             return _core.array(obj)
         return obj
     if t is tuple:
@@ -121,7 +123,9 @@ def _index(key):
     (lightarray has no integer dtype yet); everything else is converted as usual."""
     if isinstance(key, _ndarray):
         v = np.asarray(key)
-        if v.size == 0 or (v == np.floor(v)).all():
+        # float64 arrays holding whole numbers are meant as indices; int64 and
+        # bool arrays (index arrays, masks) are passed through as they are
+        if v.dtype.kind == "f" and (v.size == 0 or (v == np.floor(v)).all()):
             return v.astype(np.int64)
         return v
     if type(key) is tuple:

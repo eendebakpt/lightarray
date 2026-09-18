@@ -18,6 +18,8 @@ pub const ITEMSIZE: isize = 8;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Dims {
     ndim: u8,
+    /// Size of one element in bytes (8 for float64/int64, 1 for bool).
+    itemsize: u8,
     shape: [usize; MAX_NDIM],
     /// C-contiguous strides in bytes. Entries beyond `ndim` are zero.
     strides: [isize; MAX_NDIM],
@@ -40,14 +42,19 @@ impl fmt::Display for DimsError {
 }
 
 impl Dims {
-    /// Contiguous C-order dims for `shape`.
+    /// Contiguous C-order dims for `shape` with 8-byte elements.
     pub fn from_shape(shape: &[usize]) -> Result<Dims, DimsError> {
+        Dims::with_itemsize(shape, ITEMSIZE as usize)
+    }
+
+    /// Contiguous C-order dims for `shape` and the given element size.
+    pub fn with_itemsize(shape: &[usize], itemsize: usize) -> Result<Dims, DimsError> {
         if shape.len() > MAX_NDIM {
             return Err(DimsError::TooManyDims(shape.len()));
         }
-        let mut d = Dims { ndim: shape.len() as u8, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] };
+        let mut d = Dims { ndim: shape.len() as u8, itemsize: itemsize as u8, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] };
         d.shape[..shape.len()].copy_from_slice(shape);
-        let mut stride = ITEMSIZE;
+        let mut stride = itemsize as isize;
         for i in (0..shape.len()).rev() {
             d.strides[i] = stride;
             stride *= shape[i] as isize;
@@ -56,7 +63,27 @@ impl Dims {
     }
 
     pub fn scalar() -> Dims {
-        Dims { ndim: 0, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] }
+        Dims::scalar_with(ITEMSIZE as usize)
+    }
+
+    pub fn scalar_with(itemsize: usize) -> Dims {
+        Dims { ndim: 0, itemsize: itemsize as u8, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] }
+    }
+
+    #[inline]
+    pub fn itemsize(&self) -> usize {
+        self.itemsize as usize
+    }
+
+    /// Stride of `axis` in elements (strides are stored in bytes).
+    #[inline]
+    pub fn elem_stride(&self, axis: usize) -> usize {
+        self.strides[axis] as usize / self.itemsize as usize
+    }
+
+    /// Same shape, other element size.
+    pub fn retyped(&self, itemsize: usize) -> Dims {
+        Dims::with_itemsize(self.shape(), itemsize).expect("same ndim")
     }
 
     #[inline]
@@ -91,7 +118,7 @@ impl Dims {
 
     /// Dims of `self` with the leading axis removed (result of `a[i]`).
     pub fn drop_leading(&self, n: usize) -> Dims {
-        Dims::from_shape(&self.shape()[n..]).expect("fewer dims than self")
+        Dims::with_itemsize(&self.shape()[n..], self.itemsize as usize).expect("fewer dims than self")
     }
 }
 

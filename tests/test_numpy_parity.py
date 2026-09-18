@@ -19,6 +19,7 @@ def check(got, expected):
     if isinstance(expected, np.ndarray):
         assert isinstance(got, la.ndarray), type(got)
         assert got.shape == expected.shape
+        assert got.dtype == expected.dtype, (got.dtype, expected.dtype)
         np.testing.assert_allclose(np.asarray(got), expected, rtol=1e-13, atol=1e-13)
     else:
         assert not isinstance(got, la.ndarray)
@@ -30,7 +31,7 @@ def check(got, expected):
 
 @pytest.mark.parametrize("data", [[], [1.0], [1, 2, 3], [[1, 2], [3, 4]], [[[1.0]]], (1, 2), 3.5, 2])
 def test_array_from_python_objects(data):
-    check(la.array(data), np.array(data, dtype=np.float64))
+    check(la.array(data), np.array(data))  # dtype follows NumPy: ints -> int64, floats -> float64
 
 
 @pytest.mark.parametrize("value", [np.array(3.0), np.float64(2.5), np.zeros(())])
@@ -43,7 +44,10 @@ def test_array_from_zero_dimensional_float64_numpy(value):
 @pytest.mark.parametrize("value", [np.int64(2), np.float32(1.5), np.bool_(True), np.array(1, dtype=np.int8)])
 def test_array_from_other_numpy_scalars_keeps_dtype(value):
     got = la.array(value)
-    assert isinstance(got, np.ndarray) and got.dtype == np.asarray(value).dtype
+    expected = np.asarray(value)
+    assert got.dtype == expected.dtype
+    # int64 and bool are native dtypes; narrower ones stay NumPy arrays
+    assert isinstance(got, la.ndarray if expected.dtype in (np.int64, np.bool_) else np.ndarray)
 
 
 def test_array_from_numpy_keeps_shape():
@@ -60,7 +64,9 @@ def test_array_ragged_raises_like_numpy():
 
 def test_array_non_float_dtype_returns_numpy():
     a = la.array([1, 2, 3], dtype=np.int64)
-    assert isinstance(a, np.ndarray) and a.dtype == np.int64
+    assert isinstance(a, la.ndarray) and a.dtype == np.int64
+    b = la.array([1, 2, 3], dtype=np.int32)
+    assert isinstance(b, np.ndarray) and b.dtype == np.int32
 
 
 def test_asarray_is_identity_for_lightarray():
@@ -84,7 +90,7 @@ def test_like_helpers():
 
 @pytest.mark.parametrize("args", [(5,), (2, 5), (0, 1, 0.25), (5, 0, -1), (1, 1)])
 def test_arange(args):
-    check(la.arange(*args), np.arange(*args, dtype=np.float64))
+    check(la.arange(*args), np.arange(*args))
 
 
 @pytest.mark.parametrize("kw", [{}, {"num": 1}, {"num": 0}, {"num": 7, "endpoint": False}])
@@ -514,7 +520,7 @@ def test_comparisons_return_numpy_bool_arrays():
     before = _fallback.calls
     for op in ["lt", "le", "gt", "ge", "eq", "ne"]:
         got = _apply(op, a, 0.0)
-        assert isinstance(got, np.ndarray) and got.dtype == bool and got.flags.writeable
+        assert isinstance(got, la.ndarray) and got.dtype == bool
         np.testing.assert_array_equal(got, _apply(op, x, 0.0))
         np.testing.assert_array_equal(_apply(op, a, la.array(-x)), _apply(op, x, -x))
         np.testing.assert_array_equal(_apply(op, 0.0, a), _apply(op, 0.0, x))
@@ -743,7 +749,7 @@ def test_where_native_and_fallback():
     check(la.where(a > 0, a, la.ones(4)), np.where(x > 0, x, np.ones(4)))  # broadcast: NumPy
     check(la.where([True, False, True], la.array([1.0, 2.0, 3.0]), 0.0), np.array([1.0, 0.0, 3.0]))
     got = la.where(a > 0)  # tuple of index arrays
-    assert all(isinstance(g, np.ndarray) for g in got)
+    assert all(isinstance(g, la.ndarray) and g.dtype == np.int64 for g in got)
     with pytest.raises(ValueError):
         la.where(a > 0, a)
 
@@ -890,7 +896,7 @@ def test_shape_helpers_native():
         la.squeeze(a, axis=1)
     check(la.diff(b, n=2), np.diff(m, n=2))  # NumPy
     z = la.array([0.0, 1.0, 0.0, 2.5])
-    assert la.count_nonzero(z) == 2 and isinstance(la.count_nonzero(z), int)
+    assert la.count_nonzero(z) == 2 and isinstance(la.count_nonzero(z), np.integer)
     np.testing.assert_array_equal(la.count_nonzero(b > 0, axis=0), np.count_nonzero(m > 0, axis=0))
 
 
@@ -1035,7 +1041,7 @@ def test_predicates_native(name):
     a = la.array(x)
     before = _fallback.calls
     got = getattr(la, name)(a)
-    assert isinstance(got, np.ndarray) and got.dtype == bool
+    assert isinstance(got, la.ndarray) and got.dtype == bool
     np.testing.assert_array_equal(got, getattr(np, name)(x))
     np.testing.assert_array_equal(getattr(np, name)(a), getattr(np, name)(x))  # via __array_ufunc__
     assert getattr(la, name)(float("nan")) == bool(getattr(np, name)(float("nan")))
@@ -1059,8 +1065,10 @@ def test_array_keeps_numpy_dtype_for_non_float_inputs():
     c = la.asarray(1j)
     assert isinstance(c, np.ndarray) and c.dtype == np.complex128
     assert la.array(["a", "b"]).dtype.kind == "U"
-    check(la.array([True, False]), np.array([1.0, 0.0]))  # bools follow ints: float64 natively
-    check(la.array([1, 2]), np.array([1.0, 2.0]))  # native list path stays float64 (documented deviation)
+    check(la.array([True, False]), np.array([True, False]))
+    check(la.array([1, 2]), np.array([1, 2]))
+    check(la.array([1, 2.5]), np.array([1, 2.5]))
+    check(la.array([True, 2]), np.array([True, 2]))
 
 
 def test_shape_methods_accept_numpy_keywords():
@@ -1109,7 +1117,7 @@ def test_asarray_copy_and_device_keywords():
     for f in (la.zeros, la.ones, la.empty):
         assert f((2,), device="cpu").shape == (2,)
     check(la.full((2,), 1.5, device="cpu"), np.full((2,), 1.5))
-    check(la.arange(3, device="cpu"), np.arange(3.0))
+    check(la.arange(3, device="cpu"), np.arange(3))
     check(la.linspace(0, 1, 3, device="cpu"), np.linspace(0, 1, 3))
     assert la.__array_api_version__ == np.__array_api_version__
 
@@ -1122,7 +1130,7 @@ def test_like_helpers_keep_numpy_dtypes():
     assert la.zeros_like(i).dtype == np.int64
     check(la.zeros_like(la.ones((2, 2))), np.zeros((2, 2)))
     assert la.zeros_like(la.ones(2), shape=(3,)).shape == (3,)
-    assert isinstance(la.full((2,), False), np.ndarray) and la.full((2,), False).dtype == bool
+    assert isinstance(la.full((2,), False), la.ndarray) and la.full((2,), False).dtype == bool
 
 
 def test_finfo_iinfo_accept_arrays():
@@ -1264,3 +1272,25 @@ def test_ndarray_can_be_subclassed():
     check(t + 1, np.array([[2.5, 1.0], [1.0, 1.0]]))  # results are plain lightarray arrays
     assert type(t + 1) is la.ndarray
     assert np.asarray(t).shape == (2, 2)
+
+
+def test_signed_zero_and_infinity_special_cases():
+    x = np.array([-0.0, 0.0, 3.0, -3.0])
+    for d in (1.0, -1.0, 1.5):
+        got, exp = np.asarray(la.array(x) % d), x % d
+        np.testing.assert_array_equal(got, exp)
+        np.testing.assert_array_equal(np.signbit(got), np.signbit(exp))
+    a, b = np.array([np.inf, -np.inf, np.inf, 1.0, np.nan]), np.array([1.0, -np.inf, np.inf, -np.inf, 1.0])
+    np.testing.assert_array_equal(np.asarray(la.logaddexp(la.array(a), la.array(b))), np.logaddexp(a, b))
+    z = np.array([-0.0, 0.0, -0.5, 0.5])
+    got = np.asarray(la.trunc(la.array(z)))
+    np.testing.assert_array_equal(np.signbit(got), np.signbit(np.trunc(z)))
+
+
+def test_expand_dims_rejects_bad_axes_like_numpy():
+    a = la.ones((2, 3))
+    with pytest.raises(ValueError, match="repeated axis"):
+        la.expand_dims(a, (0, 0))
+    with pytest.raises(np.exceptions.AxisError):
+        la.expand_dims(a, 5)
+    check(la.expand_dims(la.zeros((0, 0)), (0, -1)), np.expand_dims(np.zeros((0, 0)), (0, -1)))
