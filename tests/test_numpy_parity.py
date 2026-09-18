@@ -1443,3 +1443,23 @@ def test_fftfreq_takes_the_array_api_dtype_keyword():
     check(la.fft.fftfreq(5, 0.5), np.fft.fftfreq(5, 0.5))
     check(la.fft.rfftfreq(6, d=2.0), np.fft.rfftfreq(6, d=2.0))
     assert la.fft.rfftfreq(4, dtype=np.float32).dtype == np.float32
+
+
+def test_isinstance_of_numpy_ndarray():
+    """`isinstance(a, numpy.ndarray)` is True (through `__class__`), so library
+    code gating on it takes its array branch; the real type stays lightarray's."""
+    import copy
+    import pickle
+
+    a = la.arange(6.0).reshape(2, 3)
+    for obj in (a, a[0], a[:, 1], a.T, la.arange(3), a > 2.0):
+        assert isinstance(obj, np.ndarray) and isinstance(obj, la.ndarray)
+        assert type(obj) is la.ndarray and obj.__class__ is np.ndarray
+    assert not isinstance(a[0, 0], np.ndarray) and not isinstance(a.sum(), np.ndarray)
+    assert isinstance(a, (list, np.ndarray)) and not isinstance(a, (list, tuple))
+    assert not issubclass(type(a), np.ndarray)
+    for clone in (copy.copy(a), copy.deepcopy(a), pickle.loads(pickle.dumps(a)), a + 1, np.sin(a)):
+        assert type(clone) is la.ndarray
+    assert type(np.asarray(a)) is np.ndarray  # NumPy's own conversion still gives a real ndarray
+    with pytest.raises((AttributeError, TypeError)):
+        a.__class__ = list

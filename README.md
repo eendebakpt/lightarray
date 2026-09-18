@@ -124,8 +124,16 @@ Version 0.2.0. float64, int64 and bool arrays are native, with NumPy's
 dtype inference (`np.array([1, 2])` is int64, comparisons give bool arrays,
 int and float mix to float64); every other dtype and the long tail of NumPy
 functions go through NumPy at NumPy speed plus about 1 µs and come back as
-NumPy arrays. Known limit: `isinstance(x, numpy.ndarray)` is False for a
-lightarray array and cannot be made True.
+NumPy arrays.
+
+`isinstance(a, numpy.ndarray)` is True for a lightarray array, so library code
+that checks for arrays (SciPy's root finders, OApackage's converters) takes
+its array branch. The real type is still `lightarray.ndarray`:
+`type(a) is numpy.ndarray` is False, and compiled code that demands an actual
+NumPy array (Cython's typed arguments) converts through the buffer protocol
+or rejects it. The reverse does not hold in a script that does
+`import lightarray as np`: a NumPy array that lightarray hands back for a
+dtype it does not hold is not an instance of `np.ndarray` there.
 
 Indexing with integers and slices,
 `reshape`, `ravel` and `.T` return views that share memory with the array, as
@@ -162,6 +170,10 @@ python benchmarks/perf_check.py          # ... and fail when a later build is mo
 python examples/lmfit_model_fit.py   # lmfit example running on lightarray
 python examples/lmfit_internals.py   # lmfit's own internals rebound to lightarray
 ```
+
+Tested with the test suites of lmfit (650 of 650 with lmfit's internals on
+lightarray), OApackage (115 of 115, including its SWIG-wrapped C++ entry
+points) and parts of SciPy's and NumPy's.
 
 New features must not cost the hot paths anything: run `perf_check.py --save`
 before starting on a change and `perf_check.py` after rebuilding. It measures

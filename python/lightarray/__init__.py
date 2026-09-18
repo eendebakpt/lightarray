@@ -456,6 +456,8 @@ class _ConversionsToNumpy(_types.ModuleType):
         super().__init__("lightarray")
 
     def __getattr__(self, name):
+        if name == "ndarray":
+            return _AnyNdarray  # isinstance checks accept NumPy and lightarray arrays alike
         if name in _CONVERSION_NAMES:
             return _builtins.getattr(_np, name)
         import sys as _sys
@@ -623,13 +625,48 @@ class patched:
         set_patched(self.module, self._was, self.recursive)
 
 
+_sibling_names_cache = {}
+
+
+def _sibling_module_names(top):
+    """Other pure-Python top-level modules installed by the distribution that
+    provides the package `top` (OApackage ships `oapackage` and `oalib`).
+    Compiled modules have no NumPy names to rebind and are left out, as is
+    anything the distribution lists but does not actually own on disk."""
+    if top not in _sibling_names_cache:
+        names = []
+        try:
+            import importlib.metadata as _metadata
+
+            dist = _metadata.distribution(top)
+            listed = (dist.read_text("top_level.txt") or "").split()
+            owned = {str(f) for f in (dist.files or [])}
+            for name in listed:
+                for relative in (f"{name}.py", f"{name}/__init__.py"):
+                    if name != top and not name.startswith("_") and relative in owned:
+                        # (name, file): a loaded module only counts when it is this very file,
+                        # not some other package that happens to be called `tests`
+                        names.append((name, str(dist.locate_file(relative))))
+        except Exception:  # no metadata (a module on sys.path, a namespace package): only the package itself
+            pass
+        _sibling_names_cache[top] = names
+    return _sibling_names_cache[top]
+
+
 def _package_modules(module, recursive):
     import sys as _sys
 
     mods = [module]
     if recursive and hasattr(module, "__name__"):
-        prefix = module.__name__ + "."
-        mods += [m for name, m in list(_sys.modules.items()) if name.startswith(prefix) and m is not None]
+        roots = [module.__name__]
+        if "." not in module.__name__:
+            for name, file in _sibling_module_names(module.__name__):
+                sibling = _sys.modules.get(name)
+                if sibling is not None and getattr(sibling, "__file__", None) == file:
+                    roots.append(name)
+        loaded = list(_sys.modules.items())
+        for root in roots:
+            mods += [m for name, m in loaded if m is not None and m is not module and (name == root or name.startswith(root + "."))]
     return mods
 
 

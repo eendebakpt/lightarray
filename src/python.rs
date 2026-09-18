@@ -285,6 +285,7 @@ pub fn any_of<'a>(obj: &'a Bound<'_, PyAny>) -> Option<&'a AnyArray> {
 }
 
 static NP_FLOAT64: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static NP_NDARRAY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static NP_INTP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static NP_BOOL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
@@ -980,6 +981,18 @@ impl PyArray {
     #[getter]
     fn itemsize(&self) -> usize {
         self.meta().itemsize()
+    }
+
+    /// `numpy.ndarray`, so that `isinstance(a, numpy.ndarray)` is True.
+    /// `isinstance` first looks at the real type (still `lightarray.ndarray`,
+    /// which is what `type(a)`, NumPy's C code and protocol dispatch see) and
+    /// then at `__class__`, the way mocks and proxies pass such checks.
+    /// Library code that gates on `isinstance(x, np.ndarray)` takes its array
+    /// branch, where lightarray offers ndarray's attributes and methods.
+    #[getter(__class__)]
+    fn class_for_isinstance(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let ty = NP_NDARRAY.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("ndarray")?.unbind()) })?;
+        Ok(ty.clone_ref(py))
     }
 
     #[getter]
@@ -2264,6 +2277,9 @@ struct Walk {
 
 /// Rectangular nested lists/tuples of numbers. Returns None when the input is
 /// not such a structure (ragged, contains strings, contains arrays, ...).
+// The inlining of this path is pinned: left to the optimiser it changes when
+// unrelated code is added, which moved `np.array(list)` by 10 ns.
+#[inline(never)]
 fn nested_sequence(obj: &Bound<'_, PyAny>) -> PyResult<Option<AnyArray>> {
     let mut w = Walk { ndim: 0, dims: [0; crate::dims::MAX_NDIM], floats: Vec::new(), ints: Vec::new(), saw_float: false, saw_int: false, saw_bool: false };
     if !walk(obj, 0, &mut w)? {
@@ -2284,6 +2300,7 @@ fn nested_sequence(obj: &Bound<'_, PyAny>) -> PyResult<Option<AnyArray>> {
     }))
 }
 
+#[inline(never)]
 fn walk(obj: &Bound<'_, PyAny>, depth: usize, w: &mut Walk) -> PyResult<bool> {
     if let Ok(list) = obj.cast::<PyList>() {
         walk_items(list.len(), list.iter(), depth, w)
@@ -2294,6 +2311,7 @@ fn walk(obj: &Bound<'_, PyAny>, depth: usize, w: &mut Walk) -> PyResult<bool> {
     }
 }
 
+#[inline(always)]
 fn walk_items<'py>(len: usize, items: impl Iterator<Item = Bound<'py, PyAny>>, depth: usize, w: &mut Walk) -> PyResult<bool> {
     if depth == w.ndim {
         if depth + 1 > crate::dims::MAX_NDIM {

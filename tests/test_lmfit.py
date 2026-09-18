@@ -212,13 +212,14 @@ def test_isinstance_checks_inside_patched_packages_accept_lightarray():
         "    return np.ndarray((2,), dtype=float)\n",
         mod.__dict__,
     )
-    assert mod.kind(lightarray.ones(2)) == (False, False, False)  # unpatched: NumPy's class
+    # unpatched: isinstance is True through `__class__`; the real type is lightarray's own
+    assert mod.kind(lightarray.ones(2)) == (True, True, False)
     with lightarray.patched(mod):
         assert mod.kind(lightarray.ones(2)) == (True, True, True)
         assert mod.kind(numpy.ones(2)) == (True, True, True)
         assert mod.kind([1.0, 2.0]) == (False, False, False)
         assert isinstance(mod.make(), numpy.ndarray)
-    assert mod.kind(lightarray.ones(2)) == (False, False, False)
+    assert mod.kind(lightarray.ones(2)) == (True, True, False)
 
 
 def test_proxies_survive_copy_and_pickle():
@@ -236,5 +237,59 @@ def test_proxies_survive_copy_and_pickle():
             assert copy.deepcopy(proxy) is proxy and copy.copy(proxy) is proxy
             assert pickle.loads(pickle.dumps(proxy)) is numpy.add
             assert copy.deepcopy({"f": proxy})["f"] is proxy
+        finally:
+            lightarray.unpatch_module(mod)
+
+
+def test_patching_covers_sibling_modules_of_the_same_distribution(tmp_path, monkeypatch):
+    """A distribution can install several top-level modules (OApackage ships
+    `oapackage` and the SWIG module `oalib`); patching the package covers the
+    pure-Python siblings the distribution owns, and only those."""
+    import importlib
+    import sys
+
+    dist = tmp_path / "twomod-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text("Metadata-Version: 2.1\nName: twomod\nVersion: 1.0\n")
+    (dist / "top_level.txt").write_text("twomod\ntwomod_helper\ntests\n")
+    (dist / "RECORD").write_text("twomod/__init__.py,,\ntwomod_helper.py,,\ntests/__init__.py,,\n")
+    (tmp_path / "twomod").mkdir()
+    (tmp_path / "twomod" / "__init__.py").write_text("import numpy as np\nimport twomod_helper\n")
+    (tmp_path / "twomod_helper.py").write_text("import numpy as np\n\ndef is_array(x):\n    return isinstance(x, np.ndarray)\n")
+    elsewhere = tmp_path / "elsewhere" / "tests"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "__init__.py").write_text("import numpy as np\n")  # somebody else's `tests` package
+    monkeypatch.syspath_prepend(str(tmp_path / "elsewhere"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    lightarray._sibling_names_cache.pop("twomod", None)
+    for name in ("twomod", "twomod_helper", "tests"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    twomod, helper, other = (importlib.import_module(n) for n in ("twomod", "twomod_helper", "tests"))
+    try:
+        lightarray.patch_module(twomod)
+        assert lightarray.is_patched(twomod) and helper.np is not numpy
+        assert helper.is_array(lightarray.zeros(2)) and helper.is_array(numpy.zeros(2)) and not helper.is_array([1.0])
+        assert other.np is numpy  # same name as a listed module, but not the distribution's file
+        lightarray.unpatch_module(twomod)
+        assert helper.np is numpy
+    finally:
+        lightarray.unpatch_module(twomod)
+        lightarray._sibling_names_cache.pop("twomod", None)
+
+
+def test_type_preserving_mode_accepts_both_array_types_in_isinstance(tmp_path, monkeypatch):
+    import importlib
+    import sys
+
+    (tmp_path / "isinst_mod.py").write_text("import numpy as np\n\ndef is_array(x):\n    return isinstance(x, np.ndarray)\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    monkeypatch.delitem(sys.modules, "isinst_mod", raising=False)
+    mod = importlib.import_module("isinst_mod")
+    for mode in ("lightarray", "numpy"):
+        lightarray.patch_module(mod, conversions=mode)
+        try:
+            assert mod.is_array(numpy.zeros(2)) and mod.is_array(lightarray.zeros(2)) and not mod.is_array([0.0]), mode
         finally:
             lightarray.unpatch_module(mod)

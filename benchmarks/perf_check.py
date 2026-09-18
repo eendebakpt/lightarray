@@ -23,10 +23,20 @@ How it stays quiet on a noisy machine:
 - a pure-Python reference statement is timed alongside; when the machine as a
   whole is slower or faster than at baseline time, timings are judged after
   scaling by that ratio as well as raw, and only a regression in both counts;
+  when the reference is more than 5% off (`--max-drift`) the machine is busy
+  or throttled and the script refuses to judge (exit code 2);
 - an operation that looks regressed is re-measured in further fresh
   processes before it is reported;
 - a regression must exceed both the relative tolerance (`--tolerance`, 4%)
   and an absolute one (`--min-ns`, 2.5 ns).
+
+What it cannot remove is the code-layout effect between two *builds*: adding
+any code, even an unused method, moves the hot functions and changes inlining,
+which shifts single operations by 3-8% in both directions. `.cargo/config.toml`
+aligns all functions to 64 bytes to dampen this, and the summary line reports
+the overall (geometric mean) change, so a layout shift (overall about 0, as
+many operations faster as slower) can be told from a real regression (the
+operations touched by the change slower, nothing gained).
 
 The baseline is machine-specific and therefore not committed
 (`benchmarks/.perf_baseline.json`).
@@ -34,6 +44,7 @@ The baseline is machine-specific and therefore not committed
 
 import argparse
 import json
+import math
 import os
 import platform
 import subprocess
@@ -264,6 +275,12 @@ def main():
     parser.add_argument("--processes", type=int, default=3, help="fresh processes to measure in; the minimum counts (default 3)")
     parser.add_argument("--rounds", type=int, default=5, help="measurements per operation and process (default 5)")
     parser.add_argument("--cpu", type=int, default=2, help="core to pin the measurements to on Linux (default 2); -1 to not pin")
+    parser.add_argument(
+        "--max-drift",
+        type=float,
+        default=0.05,
+        help="give up when the interpreter reference differs more than this from the baseline's (default 0.05)",
+    )
     parser.add_argument("--numpy", action="store_true", help="also time the statements with NumPy, for orientation")
     args = parser.parse_args()
 
@@ -314,6 +331,13 @@ def main():
         measured.run(suspects, 2)
 
     scale = measured.reference / base["reference_ns"]
+    if abs(scale - 1) > args.max_drift:
+        print(
+            f"the interpreter reference is {scale - 1:+.0%} off the baseline's: the machine is busy, throttled or on another\n"
+            f"kind of core (load average {os.getloadavg()[0]:.1f}, pinned to cpu {cpu}). Timings taken now mean nothing; try again\n"
+            "when it is quiet, or pick another core with --cpu."
+        )
+        return 2
     print(f"baseline: {env.get('commit')} ({env.get('date')}); now: {now['commit']}; interpreter reference {scale - 1:+.1%}\n")
     print(f"{'':11s} {'operation':28s} {'baseline':>9s} {'now':>9s} {'change':>8s}" + (f" {'NumPy':>9s}" if args.numpy else ""))
     regressions, improvements, new = [], [], []
@@ -334,6 +358,18 @@ def main():
         if improved:
             improvements.append(statement)
 
+    ratios = [measured.timings[s] / base["timings_ns"][s] for s in statements if s in base["timings_ns"]]
+    if ratios:
+        overall = math.exp(sum(math.log(r) for r in ratios) / len(ratios)) - 1
+        slower, faster = sum(r > 1.03 for r in ratios), sum(r < 0.97 for r in ratios)
+        print(f"\noverall (geometric mean) {overall:+.2%}; {slower} operation(s) more than 3% slower, {faster} more than 3% faster")
+        if regressions and abs(overall) < 0.01 and faster >= slower:
+            print(
+                "note: the build as a whole is not slower and as many operations gained as lost. That is the\n"
+                "signature of a code-layout shift (any added code moves the hot functions), not of the change\n"
+                "itself; check by building the same change under another name, or pin the inlining of the\n"
+                "affected path (#[inline(never)] / #[inline(always)])."
+            )
     print()
     if new:
         print(f"{len(new)} operation(s) not in the baseline (run --save to include them): {', '.join(new)}")
