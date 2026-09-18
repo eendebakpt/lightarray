@@ -89,11 +89,11 @@ def test_patch_toggle_and_context_manager():
     assert not lightarray.is_patched(lmfit)
     assert lightarray.set_patched(lmfit, True) is True
     assert lightarray.set_patched(lmfit, True) is True  # idempotent
-    assert lmfit.minimizer.np is lightarray
+    assert lmfit.minimizer.np is not numpy and lmfit.minimizer.np.zeros is lightarray.zeros
     assert lightarray.set_patched(lmfit, False) is False
     assert lmfit.minimizer.np is numpy
     with lightarray.patched(lmfit):
-        assert lightarray.is_patched(lmfit) and lmfit.model.np is lightarray
+        assert lightarray.is_patched(lmfit) and lmfit.model.np is not numpy
         result = minimize_example(lightarray)
         assert result.success
     assert not lightarray.is_patched(lmfit) and lmfit.model.np is numpy
@@ -104,7 +104,7 @@ def test_environment_toggle_patches_on_import(tmp_path):
     import subprocess
     import sys
 
-    code = "import lightarray, lmfit, numpy\nprint(lightarray.is_patched(lmfit), lmfit.minimizer.np is lightarray)\n"
+    code = "import lightarray, lmfit, numpy\nprint(lightarray.is_patched(lmfit), lmfit.minimizer.np is not numpy)\n"
     env = {**os.environ, "LIGHTARRAY_PATCH": "lmfit"}
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout
     assert out.strip() == "True True"
@@ -171,8 +171,51 @@ def test_dunder_array_implementations_return_numpy_while_patched():
         mod.__dict__,
     )
     with lightarray.patched(mod):
-        assert mod.np is lightarray
+        assert mod.np is not numpy
         for cls in (mod.A, mod.B, mod.C):
             assert isinstance(cls().__array__(), numpy.ndarray), cls.__name__
             numpy.testing.assert_array_equal(numpy.asarray(cls()), cls().__array__())
     assert isinstance(mod.A().__array__(), numpy.ndarray)
+
+
+def test_rebound_ufuncs_keep_their_attributes():
+    import types
+
+    mod = types.ModuleType("fake_pkg2")
+    mod.np = numpy
+    mod.add = numpy.add
+    exec("def total(x):\n    return np.add.reduce(x), add.reduce(x), np.maximum.accumulate(x), add.nin, add(x, 1)\n", mod.__dict__)
+    for mode in ("lightarray", "numpy"):
+        lightarray.patch_module(mod, conversions=mode)
+        try:
+            a, b, c, nin, d = mod.total(lightarray.array([1.0, 3.0, 2.0]))
+            assert a == 6.0 and b == 6.0 and nin == 2
+            numpy.testing.assert_array_equal(numpy.asarray(c), [1.0, 3.0, 3.0])
+            numpy.testing.assert_array_equal(numpy.asarray(d), [2.0, 4.0, 3.0])
+            assert isinstance(d, lightarray.ndarray)
+            e = mod.total(numpy.array([1.0, 3.0, 2.0]))[4]
+            assert isinstance(e, lightarray.ndarray if mode == "lightarray" else numpy.ndarray)
+        finally:
+            lightarray.unpatch_module(mod)
+
+
+def test_isinstance_checks_inside_patched_packages_accept_lightarray():
+    import types
+
+    mod = types.ModuleType("fake_pkg3")
+    mod.np = numpy
+    mod.ndarray = numpy.ndarray
+    exec(
+        "def kind(x):\n"
+        "    return isinstance(x, np.ndarray), isinstance(x, ndarray), issubclass(type(x), np.ndarray)\n"
+        "def make():\n"
+        "    return np.ndarray((2,), dtype=float)\n",
+        mod.__dict__,
+    )
+    assert mod.kind(lightarray.ones(2)) == (False, False, False)  # unpatched: NumPy's class
+    with lightarray.patched(mod):
+        assert mod.kind(lightarray.ones(2)) == (True, True, True)
+        assert mod.kind(numpy.ones(2)) == (True, True, True)
+        assert mod.kind([1.0, 2.0]) == (False, False, False)
+        assert isinstance(mod.make(), numpy.ndarray)
+    assert mod.kind(lightarray.ones(2)) == (False, False, False)

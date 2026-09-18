@@ -531,6 +531,8 @@ method_functions! {
     round_fn => ("round", "(a, decimals=0, out=None)"),
     reshape_fn => ("reshape", "(a, shape=None, order='C', *, newshape=None, copy=None)"),
     copy_fn => ("copy", "(a, order='K', subok=False)"),
+    argsort_fn => ("argsort", "(a, axis=-1, kind=None, order=None, *, stable=None)"),
+    nonzero_fn => ("nonzero", "(a)"),
     ravel_fn => ("ravel", "(a, order='C')"),
     transpose_fn => ("transpose", "(a, axes=None)"),
 }
@@ -662,7 +664,10 @@ fn isclose(py: Python<'_>, a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>, rtol: f64
 fn where_(py: Python<'_>, condition: &Bound<'_, PyAny>, x: Option<&Bound<'_, PyAny>>, y: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
     match (x, y) {
         (Some(x), Some(y)) => where_native(py, condition, x, y),
-        (None, None) => fallback(py, "call", ("where", condition.clone()), None),
+        (None, None) => match any_of(condition) {
+            Some(_) => condition.call_method0("nonzero").map(|r| r.unbind()),
+            None => fallback(py, "call", ("where", condition.clone()), None),
+        },
         _ => Err(pyo3::exceptions::PyValueError::new_err("either both or neither of x and y should be given")),
     }
 }

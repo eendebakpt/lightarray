@@ -1294,3 +1294,21 @@ def test_expand_dims_rejects_bad_axes_like_numpy():
     with pytest.raises(np.exceptions.AxisError):
         la.expand_dims(a, 5)
     check(la.expand_dims(la.zeros((0, 0)), (0, -1)), np.expand_dims(np.zeros((0, 0)), (0, -1)))
+
+
+def test_shape_assignment_reshapes_in_place():
+    x = np.arange(6.0)
+    a = la.array(x)
+    view = np.asarray(a)
+    a.shape = (2, 3)
+    x.shape = (2, 3)
+    check(a, x)
+    a.shape = (3, -1)
+    assert a.shape == (3, 2) and view.shape == (6,)
+    a.shape = 6
+    assert a.shape == (6,)
+    with pytest.raises(ValueError):
+        a.shape = (4, 2)
+    i = la.arange(4)
+    i.shape = (2, 2)
+    assert i.shape == (2, 2) and i.strides == (16, 8)

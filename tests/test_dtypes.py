@@ -251,3 +251,44 @@ def test_concatenate_and_stack_by_dtype():
     check(la.concatenate([a > 1, b > 3]), np.array([False, True, False, True]))
     assert _fallback.calls == before
     check(la.concatenate([a, la.array([0.5])]), np.array([1.0, 2.0, 0.5]))  # mixed dtypes: NumPy promotes
+
+
+def test_astype_between_native_dtypes():
+    x = np.array([1.9, -1.9, 0.0, 3.0])
+    a = la.array(x)
+    before = _fallback.calls
+    check(a.astype(int), x.astype(int))
+    check(a.astype(np.int64), x.astype(np.int64))
+    check(a.astype(bool), x.astype(bool))
+    check(a.astype(float), x)
+    check(la.array([1, 0, 2]).astype(float), np.array([1.0, 0.0, 2.0]))
+    check(la.array([1, 0, 2]).astype(bool), np.array([True, False, True]))
+    check(la.array([True, False]).astype(int), np.array([1, 0]))
+    check(la.array([True, False]).astype("float64"), np.array([1.0, 0.0]))
+    assert a.astype(float) is not a
+    assert _fallback.calls == before
+    got = a.astype(np.float32)  # not a native dtype: NumPy array
+    assert isinstance(got, np.ndarray) and got.dtype == np.float32
+    check(a.astype(int, copy=False), x.astype(int))
+    with np.errstate(invalid="ignore"):
+        np.testing.assert_array_equal(np.asarray(la.array([np.nan, 1.0]).astype(int)), np.array([np.nan, 1.0]).astype(int))
+
+
+def test_nonzero_where_and_argsort_native():
+    x = np.array([[0.0, 1.5, 0.0], [2.0, 0.0, 3.0]])
+    a = la.array(x)
+    before = _fallback.calls
+    for got, exp in zip(a.nonzero(), x.nonzero(), strict=True):
+        check(got, exp)
+    for got, exp in zip(la.where(a > 1), np.where(x > 1), strict=True):
+        check(got, exp)
+    for got, exp in zip(la.nonzero(a > 1), np.nonzero(x > 1), strict=True):
+        check(got, exp)
+    v = la.array([3.0, 1.0, 2.0, np.nan])
+    check(v.argsort(), np.array([3.0, 1.0, 2.0, np.nan]).argsort())
+    check(la.argsort(v), np.argsort(np.array([3.0, 1.0, 2.0, np.nan])))
+    check(v[v.argsort()][:3], np.array([1.0, 2.0, 3.0]))
+    assert _fallback.calls == before
+    check(a.argsort(axis=0), x.argsort(axis=0))  # NumPy
+    (idx,) = la.where(la.array([0, 5, 0, 7]))
+    check(idx, np.array([1, 3]))

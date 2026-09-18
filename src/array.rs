@@ -835,6 +835,16 @@ impl AnyArray {
     pub fn select(&self, sels: &[Selector]) -> Result<AnyArray> {
         Ok(map_each!(self, a => a.select(sels)?))
     }
+    /// In-place reshape (`a.shape = ...`): same data, new dims.
+    pub fn set_shape(&mut self, shape: &[usize]) -> Result<()> {
+        let size = self.size();
+        if shape.iter().product::<usize>() != size {
+            return Err(ArrayError::SizeMismatch { expected: shape.iter().product(), got: size });
+        }
+        let dims = Dims::with_itemsize(shape, self.itemsize())?;
+        each!(self, a => a.dims = dims);
+        Ok(())
+    }
     pub fn reshape(&self, shape: &[usize]) -> Result<AnyArray> {
         Ok(map_each!(self, a => a.reshape(shape)?))
     }
@@ -905,6 +915,74 @@ impl Array<i64> {
     }
     pub fn map_int<F: Fn(i64) -> i64>(&self, f: F) -> Array<i64> {
         Array { data: self.data.iter().map(|&a| f(a)).collect(), dims: self.dims }
+    }
+}
+
+impl AnyArray {
+    /// Convert between the native dtypes like NumPy's `astype` (C casts:
+    /// floats truncate toward zero, anything non-zero is True). None when a
+    /// float is NaN or out of the int64 range, where NumPy's result is
+    /// platform-defined and comes with a warning; the caller lets NumPy do it.
+    pub fn cast(&self, target: &str) -> Option<AnyArray> {
+        Some(match (self, target) {
+            (a, t) if a.dtype_name() == t => a.clone(),
+            (a, "float64") => AnyArray::F64(a.to_f64()),
+            (AnyArray::F64(a), "int64") => {
+                if a.data.iter().any(|v| !v.is_finite() || v.abs() >= 9.2e18) {
+                    return None;
+                }
+                AnyArray::I64(Array { data: a.data.iter().map(|&v| v as i64).collect(), dims: a.dims })
+            }
+            (AnyArray::Bool(_), "int64") => AnyArray::I64(self.to_i64()?),
+            (AnyArray::F64(a), "bool") => AnyArray::Bool(Array { data: a.data.iter().map(|&v| v != 0.0).collect(), dims: a.dims.retyped(1) }),
+            (AnyArray::I64(a), "bool") => AnyArray::Bool(Array { data: a.data.iter().map(|&v| v != 0).collect(), dims: a.dims.retyped(1) }),
+            _ => return None,
+        })
+    }
+
+    /// Indices of the non-zero elements, one int64 array per dimension
+    /// (NumPy's `nonzero`).
+    pub fn nonzero(&self) -> Vec<Array<i64>> {
+        let flat: Vec<usize> = match self {
+            AnyArray::F64(a) => a.data.iter().enumerate().filter(|(_, &v)| v != 0.0).map(|(i, _)| i).collect(),
+            AnyArray::I64(a) => a.data.iter().enumerate().filter(|(_, &v)| v != 0).map(|(i, _)| i).collect(),
+            AnyArray::Bool(a) => a.data.iter().enumerate().filter(|(_, &v)| v).map(|(i, _)| i).collect(),
+        };
+        let shape = self.shape();
+        let ndim = shape.len().max(1);
+        let mut out: Vec<Vec<i64>> = vec![Vec::with_capacity(flat.len()); ndim];
+        for &f in &flat {
+            let mut rem = f;
+            for k in (0..shape.len()).rev() {
+                out[k].push((rem % shape[k]) as i64);
+                rem /= shape[k];
+            }
+            if shape.is_empty() {
+                out[0].push(0);
+            }
+        }
+        out.into_iter().map(|v| { let n = v.len(); Array::new(v, &[n]).expect("1-d") }).collect()
+    }
+}
+
+impl Array<f64> {
+    /// Indices that sort a 1-D array (stable; NaN last like NumPy).
+    pub fn argsort_1d(&self) -> Option<Array<i64>> {
+        if self.ndim() != 1 {
+            return None;
+        }
+        let mut idx: Vec<i64> = (0..self.size() as i64).collect();
+        idx.sort_by(|&i, &j| {
+            let (a, b) = (self.data[i as usize], self.data[j as usize]);
+            match (a.is_nan(), b.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => a.partial_cmp(&b).expect("non-NaN floats compare"),
+            }
+        });
+        let n = idx.len();
+        Some(Array::new(idx, &[n]).expect("1-d"))
     }
 }
 
@@ -1111,6 +1189,18 @@ mod tests {
         assert_eq!(m.data(), &[false, true, true]);
         assert_eq!(f.compress_flat(m.data()).unwrap().data(), &[5.0, 3.0]);
         assert_eq!(compare(&f, &f, |x, y| x == y).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn cast_nonzero_argsort() {
+        let f = AnyArray::F64(Array::new(vec![1.9, -1.9, 0.0, 3.0], &[2, 2]).unwrap());
+        assert_eq!(f.cast("int64").unwrap().as_i64().unwrap().data(), &[1, -1, 0, 3]);
+        assert_eq!(f.cast("bool").unwrap().as_bool().unwrap().data(), &[true, true, false, true]);
+        assert!(AnyArray::F64(Array::new(vec![f64::NAN], &[1]).unwrap()).cast("int64").is_none());
+        let nz = f.nonzero();
+        assert_eq!((nz[0].data(), nz[1].data()), (&[0i64, 0, 1][..], &[0i64, 1, 1][..]));
+        let a = Array::new(vec![3.0, f64::NAN, 1.0, 2.0], &[4]).unwrap();
+        assert_eq!(a.argsort_1d().unwrap().data(), &[2, 3, 0, 1]);
     }
 
     #[test]

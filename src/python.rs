@@ -731,6 +731,30 @@ impl PyArray {
         PyTuple::new(py, self.arr().shape())
     }
 
+    /// `a.shape = new_shape` reshapes in place, as in NumPy. Buffer views
+    /// taken earlier keep the shape they were created with.
+    #[setter]
+    fn set_shape(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let size = self.arr().size();
+        let raw: Vec<isize> = match value.extract::<isize>() {
+            Ok(n) => vec![n],
+            Err(_) => value.extract()?,
+        };
+        let known: usize = raw.iter().filter(|&&d| d >= 0).map(|&d| d as usize).product();
+        let mut shape = Vec::with_capacity(raw.len());
+        for &d in &raw {
+            if d < 0 {
+                if raw.iter().filter(|&&x| x < 0).count() > 1 || known == 0 || size % known != 0 {
+                    return Err(PyValueError::new_err(format!("cannot reshape array of size {size} into shape {raw:?}")));
+                }
+                shape.push(size / known);
+            } else {
+                shape.push(d as usize);
+            }
+        }
+        Ok(self.arr_mut().set_shape(&shape)?)
+    }
+
     #[getter]
     fn strides<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, self.arr().dims().strides())
@@ -1306,6 +1330,53 @@ impl PyArray {
             return PyArray::from_any(arr.reshape(&[arr.size()])?).into_py(slf.py());
         }
         call_method_fallback(slf, "ravel", args, kwargs)
+    }
+
+    /// `astype(dtype)` between float64, int64 and bool natively; other
+    /// targets, keywords and non-finite float-to-int casts through NumPy.
+    #[pyo3(signature = (dtype, *args, **kwargs))]
+    fn astype<'py>(slf: &Bound<'py, Self>, dtype: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        if args.is_empty() && kwargs.map_or(true, |k| k.is_empty()) {
+            let np = py.import("numpy")?;
+            let dt = np.getattr("dtype")?.call1((dtype,))?;
+            let kind: String = dt.getattr("kind")?.extract()?;
+            let itemsize: usize = dt.getattr("itemsize")?.extract()?;
+            let target = match (kind.as_str(), itemsize) {
+                ("f", 8) => Some("float64"),
+                ("i", 8) => Some("int64"),
+                ("b", 1) => Some("bool"),
+                _ => None,
+            };
+            if let Some(cast) = target.and_then(|t| slf.get().arr().cast(t)) {
+                return PyArray::from_any(cast).into_py(py);
+            }
+        }
+        let mut full: Vec<Bound<'py, PyAny>> = vec![slf.clone().into_any(), "astype".into_pyobject(py)?.into_any(), dtype.clone()];
+        full.extend(args.iter());
+        fallback(py, "call_method", PyTuple::new(py, full)?, kwargs)
+    }
+
+    /// `nonzero()`: a tuple of int64 index arrays, one per dimension.
+    fn nonzero<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let parts: Vec<Py<PyAny>> = self
+            .arr()
+            .nonzero()
+            .into_iter()
+            .map(|a| PyArray::from_any(AnyArray::I64(a)).into_py(py))
+            .collect::<PyResult<_>>()?;
+        PyTuple::new(py, parts)
+    }
+
+    /// `argsort()` of a 1-D float64 array natively (stable).
+    #[pyo3(signature = (*args, **kwargs))]
+    fn argsort<'py>(slf: &Bound<'py, Self>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+        if args.is_empty() && kwargs.map_or(true, |k| k.is_empty()) {
+            if let Some(order) = slf.get().f64().and_then(|a| a.argsort_1d()) {
+                return PyArray::from_any(AnyArray::I64(order)).into_py(slf.py());
+            }
+        }
+        call_method_fallback(slf, "argsort", args, kwargs)
     }
 
     /// `.T`: reversed axes, as a copy.

@@ -61,7 +61,7 @@ def _inside_dunder_array():
     import sys
 
     f = sys._getframe(2)
-    for _ in range(3):  # the wrapper, its caller, one more level of helpers
+    for _ in range(6):  # wrapper, helpers and a possible ufunc proxy sit between us and __array__
         if f is None:
             return False
         if f.f_code.co_name == "__array__":
@@ -191,6 +191,31 @@ class ModuleProxy:
 
 # Private NumPy names that other libraries (SciPy) reach for anyway.
 _PRIVATE_PASSTHROUGH = ("_CopyMode", "_NoValue")
+
+
+class UfuncProxy:
+    """Stand-in for a NumPy ufunc inside a patched package: calling it runs
+    lightarray's function, while the ufunc attributes (`reduce`,
+    `accumulate`, `outer`, `at`, `nin`, ...) come from NumPy's ufunc, with
+    lightarray arguments converted. Only patched packages see these objects,
+    so direct lightarray calls keep their plain, faster functions."""
+
+    def __init__(self, call, ufunc):
+        self._call = call
+        self._ufunc = ufunc
+        self.__name__ = ufunc.__name__
+        self.__doc__ = ufunc.__doc__
+        self.__wrapped__ = ufunc
+
+    def __call__(self, *args, **kwargs):
+        return self._call(*args, **kwargs)
+
+    def __getattr__(self, name):
+        attr = getattr(self._ufunc, name)
+        return wrap_function(attr) if callable(attr) else attr
+
+    def __repr__(self):
+        return f"<lightarray proxy of ufunc '{self._ufunc.__name__}'>"
 
 
 def populate_module(namespace):

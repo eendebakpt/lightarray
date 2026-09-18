@@ -366,6 +366,70 @@ _CONVERSION_NAMES = frozenset(
 )
 
 
+class _AnyNdarrayMeta(type(_np.ndarray)):
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, (_np.ndarray, ndarray))
+
+    def __subclasscheck__(cls, sub):
+        return issubclass(sub, (_np.ndarray, ndarray))
+
+
+class _AnyNdarray(_np.ndarray, metaclass=_AnyNdarrayMeta):
+    """What `np.ndarray` means inside a patched package: `isinstance(x,
+    np.ndarray)` is True for NumPy and lightarray arrays alike, so the
+    package's array branches are taken for lightarray data too. Constructing
+    or subclassing it behaves like `numpy.ndarray`."""
+
+
+_AnyNdarray.__name__ = "ndarray"
+_AnyNdarray.__qualname__ = "ndarray"
+
+
+class _NamespaceForPackages(_types.ModuleType):
+    """What a patched package sees as `np`: lightarray, with ufuncs wrapped in
+    `UfuncProxy` so `np.add.reduce(...)` and friends keep working. Attributes
+    are cached on first access, so lookups cost the same as on a module."""
+
+    def __init__(self):
+        super().__init__("lightarray")
+
+    def __getattr__(self, name):
+        import sys as _sys
+
+        if name == "ndarray":
+            obj = _AnyNdarray
+        else:
+            obj = _builtins.getattr(_sys.modules["lightarray"], name)
+            np_obj = _builtins.getattr(_np, name, None)
+            if isinstance(np_obj, _np.ufunc) and obj is not np_obj:
+                obj = _fallback.UfuncProxy(obj, np_obj)
+        setattr(self, name, obj)
+        return obj
+
+    def __repr__(self):
+        return "<lightarray (namespace for patched packages)>"
+
+
+_namespace_for_packages = _NamespaceForPackages()
+
+
+class _TypePreservingUfunc:
+    """A ufunc inside a `conversions="numpy"` package: calls dispatch on the
+    argument types, attributes (`reduce`, `outer`, ...) are NumPy's."""
+
+    def __init__(self, dispatch, ufunc):
+        self._dispatch = dispatch
+        self._ufunc = ufunc
+        self.__name__ = ufunc.__name__
+        self.__doc__ = ufunc.__doc__
+
+    def __call__(self, *args, **kwargs):
+        return self._dispatch(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return _builtins.getattr(self._ufunc, name)
+
+
 class _ConversionsToNumpy(_types.ModuleType):
     """Stand-in for the `numpy` module alias inside packages with compiled
     kernels (SciPy): type-preserving dispatch. Conversion functions stay
@@ -394,6 +458,9 @@ class _ConversionsToNumpy(_types.ModuleType):
             dispatch.__name__ = name
             dispatch.__doc__ = getattr(np_obj, "__doc__", None)
             dispatch.__wrapped__ = np_obj
+            if isinstance(np_obj, _np.ufunc):
+                # keep np.add.reduce and friends; in this mode they stay NumPy's own
+                dispatch = _TypePreservingUfunc(dispatch, np_obj)
             setattr(self, name, dispatch)  # cache
             return dispatch
         return la_obj
@@ -412,10 +479,10 @@ def patch_module(module, recursive=True, verbose=False, conversions="lightarray"
 
     Rebinds: the ``numpy`` module object itself (any alias name), NumPy
     ufuncs and functions bound by ``from numpy import ...``, and NumPy
-    submodules (``numpy.linalg``, ...). Leaves alone: classes such as
-    ``np.ndarray`` used in ``isinstance`` checks (lightarray arrays would
-    fail them), and anything the module obtained from SciPy or other
-    libraries, which keep their own NumPy.
+    submodules (``numpy.linalg``, ...), and ``np.ndarray`` itself, which
+    becomes a class whose ``isinstance`` check accepts NumPy and lightarray
+    arrays alike. Leaves alone anything the module obtained from SciPy or
+    other libraries, which keep their own NumPy.
 
     Returns the number of names rebound. With ``recursive`` every loaded
     submodule of a package is patched too. Idempotent: names already
@@ -430,13 +497,15 @@ def patch_module(module, recursive=True, verbose=False, conversions="lightarray"
     import sys as _sys
 
     this = _sys.modules[__name__]
-    module_stand_in = _conversions_to_numpy if conversions == "numpy" else this
+    module_stand_in = _conversions_to_numpy if conversions == "numpy" else _namespace_for_packages
     count = 0
     for mod in _package_modules(module, recursive):
         for name, value in list(vars(mod).items()):
             replacement = None
             if value is _np:
                 replacement = module_stand_in
+            elif value is _np.ndarray and conversions != "numpy":
+                replacement = _AnyNdarray  # isinstance checks accept lightarray arrays too
             elif conversions == "numpy" and callable(value) and not isinstance(value, type):
                 # top-level NumPy functions imported by name get the same
                 # type-preserving dispatcher; submodule functions stay NumPy
@@ -454,7 +523,8 @@ def patch_module(module, recursive=True, verbose=False, conversions="lightarray"
             ):
                 candidate = _lightarray_equivalent(this, value)
                 if candidate is not None and candidate is not value:
-                    replacement = candidate
+                    # ufuncs keep their attributes (np.add.reduce, ...) through a proxy
+                    replacement = _fallback.UfuncProxy(candidate, value) if isinstance(value, _np.ufunc) else candidate
             if replacement is not None:
                 _patched.setdefault(mod, {}).setdefault(name, value)
                 setattr(mod, name, replacement)
