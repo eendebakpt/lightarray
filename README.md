@@ -120,7 +120,7 @@ is not a large-array library.
 
 ## Status
 
-Version 0.1.0-dev. float64, int64 and bool arrays are native, with NumPy's
+Version 0.2.0. float64, int64 and bool arrays are native, with NumPy's
 dtype inference (`np.array([1, 2])` is int64, comparisons give bool arrays,
 int and float mix to float64); every other dtype and the long tail of NumPy
 functions go through NumPy at NumPy speed plus about 1 µs and come back as
