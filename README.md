@@ -137,10 +137,13 @@ is cheap for small arrays and one extra pass over the data for large ones.
 Views that NumPy returns for delegated operations (`swapaxes`, `split`,
 `a[..., 1]`) stay views as well.
 
-Against the official Array API test suite lightarray passes about 1360 of
-1374 tests (the suite is randomised); the remaining ones are complex-number
-special cases, `finfo` and `fft.fftfreq(dtype=)`, which NumPy itself does
-not pass.
+Against the official Array API test suite lightarray passes 1372 of 1374
+tests, more than NumPy itself: `finfo` returns Python floats, `fft.fftfreq`
+takes `dtype=`, and complex `expm1` follows IEEE for infinities. The two that
+remain are decided inside NumPy or by C99: indexing a NumPy array with an
+*empty* lightarray bool mask (NumPy casts any empty non-ndarray index to
+integers), and the sign of the zero in `tanh(inf + iy)`, where NumPy, C99 and
+Python's `cmath` agree with each other and not with the test.
 
 ## Development
 

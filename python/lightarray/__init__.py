@@ -88,11 +88,32 @@ def ndim(a):
     return asarray(a).ndim  # noqa: F405
 
 
+class _FloatInfo:
+    """`numpy.finfo` of a dtype other than float64, with Python floats for
+    `eps`, `max`, `min`, `smallest_normal`, ... as the Array API asks
+    (NumPy gives `np.float32`, which is not a `float`). Python floats are weak
+    in NumPy's promotion, so `x + finfo(x.dtype).eps` keeps `x`'s dtype."""
+
+    __slots__ = ("_info",)
+
+    def __init__(self, info):
+        self._info = info
+
+    def __getattr__(self, name):
+        value = getattr(self._info, name)
+        return float(value) if isinstance(value, _np.floating) else value
+
+    def __repr__(self):
+        return repr(self._info)
+
+
 def finfo(dtype):
     """NumPy's finfo, also accepting arrays (Array API) and lightarray arrays."""
     if isinstance(dtype, (ndarray, _np.ndarray)):
         dtype = dtype.dtype
-    return _np.finfo(dtype)
+    info = _np.finfo(dtype)
+    # float64 values are np.float64, which is a Python float already
+    return info if info.dtype == _np.float64 else _FloatInfo(info)
 
 
 def iinfo(int_type):
@@ -694,6 +715,24 @@ def _norm(x, ord=None, axis=None, keepdims=False):
 
 _norm.__doc__ = _np.linalg.norm.__doc__
 linalg.norm = _norm  # noqa: F821  (linalg is the proxy created by populate_module)
+
+
+def _with_dtype(numpy_function):
+    """`fft.fftfreq` / `fft.rfftfreq` with the Array API's `dtype` keyword, which NumPy lacks."""
+
+    def function(n, d=1.0, *, dtype=None, device=None):
+        result = numpy_function(n, d, device=device)
+        if dtype is not None:
+            result = result.astype(dtype, copy=False)
+        return _fallback.from_numpy(result)
+
+    function.__name__ = function.__qualname__ = numpy_function.__name__
+    function.__doc__ = numpy_function.__doc__
+    return function
+
+
+fft.fftfreq = _with_dtype(_np.fft.fftfreq)  # noqa: F821  (fft is a proxy, like linalg)
+fft.rfftfreq = _with_dtype(_np.fft.rfftfreq)  # noqa: F821
 _fallback.install_numpy_protocols(_native_functions)
 _auto_patch_from_environment()
 
