@@ -117,7 +117,12 @@ fn asarray(py: Python<'_>, object: &Bound<'_, PyAny>, dtype: Option<&Bound<'_, P
         return Err(pyo3::exceptions::PyValueError::new_err("Unable to avoid copy while creating an array as requested."));
     }
     if dtype.map_or(true, |d| d.is_none()) {
-        return array_or_numpy(py, object);
+        let result = array_or_numpy(py, object)?;
+        if copy == Some(true) && result.bind(py).is(object) {
+            // a NumPy array of a dtype lightarray leaves to NumPy
+            return object.call_method0("copy").map(|r| r.unbind());
+        }
+        return Ok(result);
     }
     if is_float64_or_none(py, dtype)? {
         return PyArray::new(array_from_any(py, object)?).into_py(py);
@@ -372,8 +377,12 @@ fn unary(py: Python<'_>, name: &str, x: &Bound<'_, PyAny>, f: fn(f64) -> f64) ->
         }
         return PyArray::new(any.to_f64().map(f)).into_py(py);
     }
-    if x.is_instance_of::<pyo3::types::PyFloat>() || x.is_instance_of::<pyo3::types::PyInt>() {
+    if x.is_exact_instance_of::<pyo3::types::PyFloat>() || x.is_exact_instance_of::<pyo3::types::PyInt>() {
         return Ok(f(x.extract()?).into_pyobject(py)?.into_any().unbind());
+    }
+    if x.is_instance_of::<pyo3::types::PyFloat>() {
+        // np.float64 in, np.float64 out
+        return crate::python::np_float(py, f(x.extract()?));
     }
     fallback(py, "call", (name, x.clone()), None)
 }
@@ -563,7 +572,6 @@ method_functions! {
     round_fn => ("round", "(a, decimals=0, out=None)"),
     reshape_fn => ("reshape", "(a, shape=None, order='C', *, newshape=None, copy=None)"),
     copy_fn => ("copy", "(a, order='K', subok=False)"),
-    argsort_fn => ("argsort", "(a, axis=-1, kind=None, order=None, *, stable=None)"),
     nonzero_fn => ("nonzero", "(a)"),
     ravel_fn => ("ravel", "(a, order='C')"),
     transpose_fn => ("transpose", "(a, axes=None)"),
@@ -708,6 +716,32 @@ fn where_(py: Python<'_>, condition: &Bound<'_, PyAny>, x: Option<&Bound<'_, PyA
     }
 }
 
+/// `argsort(a, axis=-1, kind=None, order=None, *, stable=None, descending=False)`:
+/// the `argsort` method for lightarray arrays, NumPy's function otherwise.
+/// `descending` is the Array API keyword NumPy lacks.
+#[pyfunction]
+#[pyo3(signature = (a, *args, **kwargs), text_signature = "(a, axis=-1, kind=None, order=None, *, stable=None, descending=False)")]
+fn argsort<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
+    if let Some(k) = kwargs {
+        if let Some(d) = k.get_item("descending")? {
+            let rest = k.copy()?;
+            rest.del_item("descending")?;
+            if d.is_truthy()? {
+                let mut full: Vec<Bound<'py, PyAny>> = vec![a.clone()];
+                full.extend(args.iter());
+                return fallback(py, "argsort_descending", PyTuple::new(py, full)?, Some(&rest));
+            }
+            return argsort(py, a, args, Some(&rest));
+        }
+    }
+    if a.is_instance_of::<PyArray>() {
+        return a.call_method("argsort", args.clone(), kwargs).map(|r| r.unbind());
+    }
+    let mut full: Vec<Bound<'py, PyAny>> = vec!["argsort".into_pyobject(py)?.into_any(), a.clone()];
+    full.extend(args.iter());
+    fallback(py, "call", PyTuple::new(py, full)?, kwargs)
+}
+
 /// `sort(a, axis=-1, kind=None, order=None, *, stable=None, descending=False)`:
 /// native for 1-D lightarray input; NumPy otherwise (`descending` is the
 /// Array API keyword NumPy lacks, applied by reversing along the axis).
@@ -782,6 +816,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(stack, m)?,
         wrap_pyfunction!(where_, m)?,
         wrap_pyfunction!(sort, m)?,
+        wrap_pyfunction!(argsort, m)?,
         wrap_pyfunction!(isclose, m)?,
     ] {
         m.add_function(f)?;

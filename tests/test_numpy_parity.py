@@ -1334,3 +1334,29 @@ def test_out_arguments_return_the_callers_object():
     np.testing.assert_allclose(nout, x + y)
     check(la.sqrt(la.array([4.0, -1.0, 9.0]), where=np.array([True, False, True]), out=la.zeros(3)), np.array([2.0, 0.0, 3.0]))
     check(la.add(a, b, dtype=np.float64), x + y)
+
+
+def test_argsort_descending_and_nonzero_of_a_scalar():
+    x = np.array([3.0, 1.0, 3.0, 2.0, 1.0])
+    a = la.array(x)
+    order = la.argsort(a, descending=True, stable=True)
+    assert np.asarray(order).tolist() == [0, 2, 3, 1, 4]
+    assert np.asarray(la.argsort(a, descending=False)).tolist() == np.argsort(x, stable=True).tolist()
+    m = rng_data(3, 4)
+    np.testing.assert_array_equal(
+        np.asarray(la.take_along_axis(la.array(m), la.argsort(la.array(m), axis=0, descending=True), axis=0)), -np.sort(-m, axis=0)
+    )
+    with pytest.raises(ValueError):
+        la.nonzero(la.array(1.0))
+    with pytest.raises(ValueError):
+        la.array(1.0).nonzero()
+
+
+def test_asarray_copy_and_numpy_scalars():
+    u = np.array([1, 2], dtype=np.uint8)
+    c = la.asarray(u, copy=True)
+    assert c is not u and not np.shares_memory(c, u) and c.dtype == np.uint8
+    assert la.asarray(u) is u
+    assert type(la.cos(np.float64(0.0))) is np.float64
+    assert type(la.cos(0.0)) is float
+    assert type(la.log(np.float64(1.0))) is np.float64

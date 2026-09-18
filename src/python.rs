@@ -6,6 +6,7 @@
 //! wrapped back into `PyArray`.
 
 use crate::array::{compare, compare_scalar, AnyArray, Array, ArrayError, Scalar, Selector};
+use crate::dims::MAX_NDIM;
 use pyo3::buffer::{PyBuffer, PyUntypedBuffer};
 use pyo3::call::PyCallArgs;
 use pyo3::exceptions::{PyBufferError, PyIndexError, PyTypeError, PyValueError};
@@ -42,6 +43,23 @@ impl From<ArrayError> for PyErr {
 #[pyclass(name = "ndarray", module = "lightarray", frozen, subclass)]
 pub struct PyArray {
     inner: std::cell::UnsafeCell<AnyArray>,
+    /// Set for strided views (`a[:, 0]`, `a[::2]`, `a.T`); see `Strided`.
+    strided: Option<Box<Strided>>,
+}
+
+/// A strided view. The kernels only know contiguous buffers, so `inner` is a
+/// contiguous cache of the view: every read access refreshes it from the
+/// base's memory, every native write is followed by `commit`, which scatters
+/// it back, and the buffer protocol exports the base's memory itself with
+/// these strides, so NumPy reads and writes the real thing. Refreshing costs
+/// one pass over the view's elements per access.
+pub struct Strided {
+    /// The array owning the memory.
+    base: Py<PyAny>,
+    /// Address of the view's first element, inside `base`'s buffer.
+    ptr: *mut u8,
+    /// Byte strides per axis of the view.
+    strides: [isize; MAX_NDIM],
 }
 
 // SAFETY: see the type docs; mutation is confined to GIL-holding methods and
@@ -63,15 +81,92 @@ impl PyArray {
     }
 
     pub fn from_any(inner: AnyArray) -> PyArray {
-        PyArray { inner: std::cell::UnsafeCell::new(inner) }
+        PyArray { inner: std::cell::UnsafeCell::new(inner), strided: None }
     }
 
     /// Shared access to the array, whatever its dtype.
     #[inline]
     pub fn arr(&self) -> &AnyArray {
+        if self.strided.is_some() {
+            self.refresh();
+        }
         // SAFETY: readers and the GIL-serialised writers never overlap on the
         // GIL build; see the type docs for the free-threaded contract.
         unsafe { &*self.inner.get() }
+    }
+
+    /// Shape, dtype and size without refreshing a strided view's cache.
+    #[inline]
+    pub fn meta(&self) -> &AnyArray {
+        // SAFETY: as for `arr`.
+        unsafe { &*self.inner.get() }
+    }
+
+    /// Reload a strided view's cache from the base's memory.
+    #[cold]
+    fn refresh(&self) {
+        if let Some(s) = &self.strided {
+            // SAFETY: `s.ptr`/`s.strides` address elements of `s.base`'s
+            // buffer, which never moves; the cache has the view's shape.
+            unsafe {
+                let cache = &mut *self.inner.get();
+                let ndim = cache.ndim();
+                cache.gather_from(s.ptr, &s.strides[..ndim]);
+            }
+        }
+    }
+
+    /// Address of the element at a full integer index of a strided view, so
+    /// scalar reads and writes skip the cache. None for other arrays and for
+    /// partial indices.
+    fn strided_element(&self, idx: &[isize]) -> PyResult<Option<*mut u8>> {
+        let Some(s) = &self.strided else { return Ok(None) };
+        let shape = self.meta().shape();
+        if idx.len() != shape.len() {
+            return Ok(None);
+        }
+        let mut ptr = s.ptr;
+        for (axis, (&i, &len)) in idx.iter().zip(shape).enumerate() {
+            let k = if i < 0 { i + len as isize } else { i };
+            if k < 0 || k >= len as isize {
+                return Err(ArrayError::IndexOutOfBounds { index: i, axis, len }.into());
+            }
+            ptr = ptr.wrapping_offset(k * s.strides[axis]);
+        }
+        Ok(Some(ptr))
+    }
+
+    /// Where the elements really live: first element and element strides
+    /// (the base's memory for strided views). Used by the DLPack export.
+    pub fn element_layout(&self) -> (*mut u8, [i64; MAX_NDIM]) {
+        let meta = self.meta();
+        let mut strides = [0i64; MAX_NDIM];
+        match &self.strided {
+            Some(s) => {
+                for k in 0..meta.ndim() {
+                    strides[k] = (s.strides[k] / meta.itemsize() as isize) as i64;
+                }
+                (s.ptr, strides)
+            }
+            None => {
+                for (k, stride) in strides.iter_mut().enumerate().take(meta.ndim()) {
+                    *stride = meta.dims().elem_stride(k) as i64;
+                }
+                (meta.data_ptr() as *mut u8, strides)
+            }
+        }
+    }
+
+    /// Write a strided view's cache back to the base after a native write.
+    #[inline]
+    pub fn commit(&self) {
+        if let Some(s) = &self.strided {
+            // SAFETY: as for `refresh`.
+            unsafe {
+                let cache = &*self.inner.get();
+                cache.scatter_to(s.ptr, &s.strides[..cache.ndim()]);
+            }
+        }
     }
 
     /// Mutable access to the data. Callers must hold the GIL and must not
@@ -79,6 +174,9 @@ impl PyArray {
     #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn arr_mut(&self) -> &mut AnyArray {
+        if self.strided.is_some() {
+            self.refresh();
+        }
         // SAFETY: as above; only element values are written.
         unsafe { &mut *self.inner.get() }
     }
@@ -433,7 +531,10 @@ pub fn binary_native(
         (Operand::Float(s), Operand::F64(b)) => b.map(|x| f(s, x)),
         (Operand::F64(a), Operand::Int(s)) => a.map(|x| f(x, s as f64)),
         (Operand::Int(s), Operand::F64(b)) => b.map(|x| f(s as f64, x)),
-        (Operand::Float(a), Operand::Float(b)) => return Ok(f(a, b).into_pyobject(py)?.into_any().unbind()),
+        // Python floats only: NumPy scalars keep their own type (np.float32, ...) in NumPy
+        (Operand::Float(a), Operand::Float(b)) if x1.is_exact_instance_of::<PyFloat>() && x2.is_exact_instance_of::<PyFloat>() => {
+            return Ok(f(a, b).into_pyobject(py)?.into_any().unbind())
+        }
         _ => return fallback(py, "call", (name, x1.clone(), x2.clone()), None),
     };
     PyArray::new(result).into_py(py)
@@ -728,14 +829,19 @@ impl PyArray {
 
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.arr().shape())
+        PyTuple::new(py, self.meta().shape())
     }
 
     /// `a.shape = new_shape` reshapes in place, as in NumPy. Buffer views
     /// taken earlier keep the shape they were created with.
     #[setter]
     fn set_shape(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let size = self.arr().size();
+        if self.strided.is_some() {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(
+                "Incompatible shape for in-place modification. Use `.reshape()` to make a copy with the desired shape.",
+            ));
+        }
+        let size = self.meta().size();
         let raw: Vec<isize> = match value.extract::<isize>() {
             Ok(n) => vec![n],
             Err(_) => value.extract()?,
@@ -757,27 +863,30 @@ impl PyArray {
 
     #[getter]
     fn strides<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.arr().dims().strides())
+        match &self.strided {
+            Some(v) => PyTuple::new(py, &v.strides[..self.meta().ndim()]),
+            None => PyTuple::new(py, self.meta().dims().strides()),
+        }
     }
 
     #[getter]
     fn ndim(&self) -> usize {
-        self.arr().ndim()
+        self.meta().ndim()
     }
 
     #[getter]
     fn size(&self) -> usize {
-        self.arr().size()
+        self.meta().size()
     }
 
     #[getter]
     fn itemsize(&self) -> usize {
-        self.arr().itemsize()
+        self.meta().itemsize()
     }
 
     #[getter]
     fn nbytes(&self) -> usize {
-        self.arr().size() * self.arr().itemsize()
+        self.meta().size() * self.meta().itemsize()
     }
 
     /// Makes NumPy arrays and scalars defer to our reflected operators, so
@@ -790,7 +899,7 @@ impl PyArray {
 
     #[getter]
     fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        py.import("numpy")?.getattr("dtype")?.call1((self.arr().dtype_name(),))
+        py.import("numpy")?.getattr("dtype")?.call1((self.meta().dtype_name(),))
     }
 
     // ---- conversions ----
@@ -806,7 +915,7 @@ impl PyArray {
     }
 
     fn __len__(&self) -> PyResult<usize> {
-        match self.arr().shape().first() {
+        match self.meta().shape().first() {
             Some(&n) => Ok(n),
             None => Err(PyTypeError::new_err("len() of unsized object")),
         }
@@ -870,14 +979,25 @@ impl PyArray {
         if view.is_null() {
             return Err(PyBufferError::new_err("view is null"));
         }
-        let arr = slf.get().arr();
+        let arr = slf.get().meta();
         let ndim = arr.ndim();
         let itemsize = arr.itemsize();
+        let strided = slf.get().strided.as_deref();
+        if strided.is_some() && (flags & ffi::PyBUF_STRIDES) != ffi::PyBUF_STRIDES {
+            return Err(PyBufferError::new_err("ndarray is not C-contiguous"));
+        }
+        if strided.is_some() && (flags & ffi::PyBUF_C_CONTIGUOUS) == ffi::PyBUF_C_CONTIGUOUS {
+            return Err(PyBufferError::new_err("ndarray is not C-contiguous"));
+        }
         // SAFETY: `view` is a valid Py_buffer; the pointers we store refer to
-        // memory owned by `slf`, which `view.obj` keeps alive.
+        // memory owned by `slf` (or its base, which it keeps alive), and
+        // `view.obj` keeps `slf` alive.
         unsafe {
             (*view).obj = slf.clone().into_any().into_ptr();
-            (*view).buf = arr.data_ptr() as *mut c_void;
+            (*view).buf = match strided {
+                Some(v) => v.ptr as *mut c_void,
+                None => arr.data_ptr() as *mut c_void,
+            };
             (*view).len = (arr.size() * itemsize) as isize;
             (*view).readonly = 0;
             (*view).itemsize = itemsize as isize;
@@ -895,7 +1015,9 @@ impl PyArray {
             } else {
                 ptr::null_mut()
             };
-            (*view).strides = if ndim > 0 && (flags & ffi::PyBUF_STRIDES) == ffi::PyBUF_STRIDES {
+            (*view).strides = if let (Some(v), true) = (strided, ndim > 0) {
+                v.strides.as_ptr() as *mut ffi::Py_ssize_t
+            } else if ndim > 0 && (flags & ffi::PyBUF_STRIDES) == ffi::PyBUF_STRIDES {
                 arr.dims().strides_ptr() as *mut ffi::Py_ssize_t
             } else {
                 ptr::null_mut()
@@ -1303,7 +1425,10 @@ impl PyArray {
         }
         let arr = slf.get().arr();
         let shape = extract_shape_args(shape, arr.size())?;
-        PyArray::from_any(arr.reshape(&shape)?).into_py(py)
+        if slf.get().strided.is_some() {
+            return PyArray::from_any(arr.reshape(&shape)?).into_py(py);
+        }
+        PyArray::from_any(arr.reshape_view(&shape, || base_of(slf))?).into_py(py)
     }
 
     #[pyo3(signature = (*args, **kwargs))]
@@ -1327,7 +1452,10 @@ impl PyArray {
     fn ravel<'py>(slf: &Bound<'py, Self>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
         if c_order_only(args, kwargs)? {
             let arr = slf.get().arr();
-            return PyArray::from_any(arr.reshape(&[arr.size()])?).into_py(slf.py());
+            if slf.get().strided.is_some() {
+                return PyArray::from_any(arr.reshape(&[arr.size()])?).into_py(slf.py());
+            }
+            return PyArray::from_any(arr.reshape_view(&[arr.size()], || base_of(slf))?).into_py(slf.py());
         }
         call_method_fallback(slf, "ravel", args, kwargs)
     }
@@ -1359,6 +1487,11 @@ impl PyArray {
 
     /// `nonzero()`: a tuple of int64 index arrays, one per dimension.
     fn nonzero<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        if self.meta().ndim() == 0 {
+            return Err(PyValueError::new_err(
+                "Calling nonzero on 0d arrays is not allowed. Use np.atleast_1d(scalar).nonzero() instead.",
+            ));
+        }
         let parts: Vec<Py<PyAny>> = self
             .arr()
             .nonzero()
@@ -1380,19 +1513,27 @@ impl PyArray {
     }
 
     /// `.T`: reversed axes, as a copy.
+    /// The array whose memory this one shares, None when it owns its data.
+    #[getter]
+    fn base(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        match &self.strided {
+            Some(v) => Some(v.base.clone_ref(py)),
+            None => self.meta().base().map(|b| b.clone_ref(py)),
+        }
+    }
+
     #[getter]
     #[pyo3(name = "T")]
-    fn transpose_property(&self) -> PyArray {
-        PyArray::from_any(self.arr().transpose())
+    fn transpose_property(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        transposed(slf)
     }
 
     /// `transpose()` with no axes natively; explicit axes through NumPy.
     #[pyo3(signature = (*args, **kwargs))]
     fn transpose<'py>(slf: &Bound<'py, Self>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<Py<PyAny>> {
-        let py = slf.py();
         let bare = kwargs.map_or(true, |k| k.is_empty()) && (args.is_empty() || (args.len() == 1 && args.get_item(0)?.is_none()));
         if bare {
-            return PyArray::from_any(slf.get().arr().transpose()).into_py(py);
+            return transposed(slf);
         }
         call_method_fallback(slf, "transpose", args, kwargs)
     }
@@ -1407,7 +1548,7 @@ impl PyArray {
         // Native only for a full integer index with a value of the array's
         // own kind; everything else (partial indices, slices, masks, casts)
         // is NumPy's assignment through the writable view.
-        let ndim = slf.get().arr().ndim();
+        let ndim = slf.get().meta().ndim();
         let idx: Option<Vec<isize>> = if key.is_instance_of::<PyInt>() && ndim == 1 {
             Some(vec![key.extract::<isize>()?])
         } else if let Ok(tuple) = key.cast::<PyTuple>() {
@@ -1420,12 +1561,45 @@ impl PyArray {
             None
         };
         if let Some(idx) = idx {
+            if let Some(p) = slf.get().strided_element(&idx)? {
+                // a strided view: write the element straight into the base
+                // SAFETY: `p` addresses an element of the base's buffer.
+                unsafe {
+                    match (slf.get().meta(), classify(value)) {
+                        (AnyArray::F64(_), v @ (Operand::Float(_) | Operand::Int(_) | Operand::Bool(_))) => {
+                            *(p as *mut f64) = v.scalar().expect("scalar");
+                            return Ok(());
+                        }
+                        (AnyArray::I64(_), Operand::Int(i)) => {
+                            *(p as *mut i64) = i;
+                            return Ok(());
+                        }
+                        (AnyArray::Bool(_), Operand::Bool(b)) => {
+                            *(p as *mut bool) = b;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+                fallback(py, "setitem", (slf.clone(), key.clone(), value.clone()), None)?;
+                return Ok(());
+            }
             match (slf.get().arr_mut(), classify(value)) {
                 (AnyArray::F64(a), v @ (Operand::Float(_) | Operand::Int(_) | Operand::Bool(_))) => {
-                    return Ok(a.set(&idx, v.scalar().expect("scalar"))?);
+                    a.set(&idx, v.scalar().expect("scalar"))?;
+                    slf.get().commit();
+                    return Ok(());
                 }
-                (AnyArray::I64(a), Operand::Int(i)) => return Ok(a.set(&idx, i)?),
-                (AnyArray::Bool(a), Operand::Bool(b)) => return Ok(a.set(&idx, b)?),
+                (AnyArray::I64(a), Operand::Int(i)) => {
+                    a.set(&idx, i)?;
+                    slf.get().commit();
+                    return Ok(());
+                }
+                (AnyArray::Bool(a), Operand::Bool(b)) => {
+                    a.set(&idx, b)?;
+                    slf.get().commit();
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -1459,6 +1633,7 @@ impl PyArray {
     fn fill(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         if let (Some(a), Some(v)) = (slf.get().f64_mut(), classify(value).scalar()) {
             a.map_inplace(|_| v);
+            slf.get().commit();
             return Ok(());
         }
         fallback(slf.py(), "call_method", (slf.clone(), "fill", value.clone()), None).map(|_| ())
@@ -1470,17 +1645,19 @@ impl PyArray {
     /// ellipsis, None, fancy and boolean indexing through NumPy.
     fn __getitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let arr = slf.get().arr();
+        // basic indexing needs the shape only; a strided view's cache is
+        // refreshed further down, where elements are gathered
+        let arr = slf.get().meta();
         // Type checks first: a failed `extract` builds a Python exception,
         // which costs more than the whole slice.
         if key.is_instance_of::<PyInt>() {
-            return index_result(py, arr, &[key.extract::<isize>()?]);
+            return index_result(slf, &[key.extract::<isize>()?]);
         }
         if let Ok(slice) = key.cast::<PySlice>() {
             if arr.ndim() == 0 {
                 return Err(PyIndexError::new_err("too many indices for array: array is 0-dimensional"));
             }
-            return PyArray::from_any(arr.select(&[slice_selector(slice, arr.shape()[0])?])?).into_py(py);
+            return select_result(slf, &[slice_selector(slice, arr.shape()[0])?], &[]);
         }
         if let Ok(tuple) = key.cast::<PyTuple>() {
             let mut ints = Vec::with_capacity(tuple.len());
@@ -1513,22 +1690,15 @@ impl PyArray {
                 }
             }
             if all_ints {
-                return index_result(py, arr, &ints);
+                return index_result(slf, &ints);
             }
-            let selected = arr.select(&sels)?;
-            if new_axes.is_empty() {
-                return PyArray::from_any(selected).into_py(py);
-            }
-            let mut shape: Vec<usize> = selected.shape().to_vec();
-            for &pos in &new_axes {
-                shape.insert(pos.min(shape.len()), 1);
-            }
-            return PyArray::from_any(selected.reshape(&shape)?).into_py(py);
+            return select_result(slf, &sels, &new_axes);
         }
         if key.is_none() {
-            let mut shape = vec![1];
-            shape.extend_from_slice(arr.shape());
-            return PyArray::from_any(arr.reshape(&shape)?).into_py(py);
+            return select_result(slf, &[], &[0]);
+        }
+        if key.is(py.Ellipsis()) {
+            return select_result(slf, &[], &[]);
         }
         // A list of integers: rows along the leading axis.
         if let Ok(list) = key.cast::<PyList>() {
@@ -1540,25 +1710,25 @@ impl PyArray {
                     return fallback(py, "getitem", (slf.clone(), key.clone()), None);
                 }
             }
-            return PyArray::from_any(arr.take_leading(&idx)?).into_py(py);
+            return PyArray::from_any(slf.get().arr().take_leading(&idx)?).into_py(py);
         }
         // An int64 lightarray used as an index array along the leading axis.
         if let Some(AnyArray::I64(index)) = any_of(key) {
             if index.ndim() == 1 {
                 let idx: Vec<isize> = index.data().iter().map(|&i| i as isize).collect();
-                return PyArray::from_any(arr.take_leading(&idx)?).into_py(py);
+                return PyArray::from_any(slf.get().arr().take_leading(&idx)?).into_py(py);
             }
         }
         // A boolean mask of the array's shape (a lightarray or NumPy bool array).
         if let Some(mask) = bool_mask(key) {
             if mask.1 == arr.shape() {
-                return PyArray::from_any(arr.compress_flat(&mask.0)?).into_py(py);
+                return PyArray::from_any(slf.get().arr().compress_flat(&mask.0)?).into_py(py);
             }
         }
         // NumPy integer scalars (and anything else with __index__) index too.
         if key.hasattr("__index__")? {
             if let Ok(i) = key.extract::<isize>() {
-                return index_result(py, arr, &[i]);
+                return index_result(slf, &[i]);
             }
         }
         fallback(py, "getitem", (slf.clone(), key.clone()), None)
@@ -1588,8 +1758,9 @@ fn inplace_op<F: Fn(f64, f64) -> f64>(
     };
     match operand {
         Operand::F64(b) => {
-            if std::ptr::eq(b as *const Array<f64>, a as *const Array<f64>) {
-                let copy = a.clone();
+            if overlaps(a.span(), b.span()) {
+                // the operand is the target itself or a view sharing its memory
+                let copy = b.clone();
                 a.zip_map_inplace(&copy, f)?;
             } else {
                 a.zip_map_inplace(b, f)?;
@@ -1608,16 +1779,188 @@ fn inplace_op<F: Fn(f64, f64) -> f64>(
             a.map_inplace(|x| f(x, v));
         }
     }
+    slf.get().commit();
     Ok(())
 }
 
-fn index_result(py: Python<'_>, arr: &AnyArray, idx: &[isize]) -> PyResult<Py<PyAny>> {
+/// The array owning the buffer of `slf`: its base when it is a view itself.
+fn base_of(slf: &Bound<'_, PyArray>) -> Py<PyAny> {
+    if let Some(v) = &slf.get().strided {
+        return v.base.clone_ref(slf.py());
+    }
+    match slf.get().meta().base() {
+        Some(base) => base.clone_ref(slf.py()),
+        None => slf.clone().into_any().unbind(),
+    }
+}
+
+/// Where the elements of an array live: first element, shape, byte strides.
+/// Fixed-size, so composing layouts allocates nothing.
+struct Layout {
+    ptr: *mut u8,
+    ndim: usize,
+    shape: [usize; MAX_NDIM],
+    strides: [isize; MAX_NDIM],
+}
+
+fn layout_of(slf: &Bound<'_, PyArray>) -> Layout {
+    let this = slf.get();
+    let meta = this.meta();
+    let ndim = meta.ndim();
+    let mut shape = [0usize; MAX_NDIM];
+    shape[..ndim].copy_from_slice(meta.shape());
+    let mut strides = [0isize; MAX_NDIM];
+    let ptr = match &this.strided {
+        Some(v) => {
+            strides = v.strides;
+            v.ptr
+        }
+        None => {
+            strides[..ndim].copy_from_slice(meta.dims().strides());
+            meta.data_ptr() as *mut u8
+        }
+    };
+    Layout { ptr, ndim, shape, strides }
+}
+
+impl Layout {
+    fn shape(&self) -> &[usize] {
+        &self.shape[..self.ndim]
+    }
+
+    /// Apply a basic-indexing plan (`(start, step, count)` per axis; integer
+    /// selectors are the entries of `sels` that drop their axis).
+    fn select(&self, plan: &[(usize, isize, usize)], sels: &[Selector]) -> Layout {
+        let mut out = Layout { ptr: self.ptr, ndim: 0, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] };
+        for (axis, &(start, step, count)) in plan.iter().enumerate() {
+            if count > 0 {
+                out.ptr = out.ptr.wrapping_offset(start as isize * self.strides[axis]);
+            }
+            if !matches!(sels.get(axis), Some(Selector::Int(_))) {
+                out.shape[out.ndim] = count;
+                out.strides[out.ndim] = step * self.strides[axis];
+                out.ndim += 1;
+            }
+        }
+        out
+    }
+
+    /// Insert a length-1 axis at `pos` (`None` in an index).
+    fn insert_axis(&mut self, pos: usize) -> PyResult<()> {
+        if self.ndim == MAX_NDIM {
+            return Err(PyValueError::new_err(format!("at most {MAX_NDIM} dimensions are supported")));
+        }
+        let pos = pos.min(self.ndim);
+        self.shape.copy_within(pos..self.ndim, pos + 1);
+        self.strides.copy_within(pos..self.ndim, pos + 1);
+        self.shape[pos] = 1;
+        self.strides[pos] = 0;
+        self.ndim += 1;
+        Ok(())
+    }
+
+    fn reversed(&self) -> Layout {
+        let mut out = Layout { ptr: self.ptr, ndim: self.ndim, shape: [0; MAX_NDIM], strides: [0; MAX_NDIM] };
+        for k in 0..self.ndim {
+            out.shape[k] = self.shape[self.ndim - 1 - k];
+            out.strides[k] = self.strides[self.ndim - 1 - k];
+        }
+        out
+    }
+
+    fn is_c_contiguous(&self, itemsize: usize) -> bool {
+        let mut expected = itemsize as isize;
+        for k in (0..self.ndim).rev() {
+            if self.shape[k] != 1 && self.strides[k] != expected {
+                return false;
+            }
+            expected *= self.shape[k] as isize;
+        }
+        true
+    }
+}
+
+/// The array described by `layout` inside the memory `slf` lives in: a
+/// contiguous window when the layout allows, a strided view otherwise.
+fn view_from_layout(slf: &Bound<'_, PyArray>, layout: Layout) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    let meta = slf.get().meta();
+    if layout.shape().iter().product::<usize>() == 0 {
+        return PyArray::from_any(meta.zeros_like(layout.shape())?).into_py(py);
+    }
+    if layout.is_c_contiguous(meta.itemsize()) {
+        // SAFETY: the layout was derived from `slf`'s own by basic indexing,
+        // so it addresses elements of the buffer `base_of(slf)` owns.
+        let view = unsafe { meta.raw_view_like(layout.ptr, layout.shape(), base_of(slf))? };
+        return PyArray::from_any(view).into_py(py);
+    }
+    let view = PyArray {
+        inner: std::cell::UnsafeCell::new(meta.zeros_like(layout.shape())?),
+        strided: Some(Box::new(Strided { base: base_of(slf), ptr: layout.ptr, strides: layout.strides })),
+    };
+    view.into_py(py)
+}
+
+/// `a.T`: the same memory with the axes reversed.
+fn transposed(slf: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
+    view_from_layout(slf, layout_of(slf).reversed())
+}
+
+/// Do two arrays share any memory?
+fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+/// `a[i, j]`: a NumPy scalar for a full index, a view of the sub-array otherwise.
+fn index_result(slf: &Bound<'_, PyArray>, idx: &[isize]) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    if let Some(p) = slf.get().strided_element(idx)? {
+        // SAFETY: `p` addresses an element of the base's buffer.
+        return unsafe {
+            match slf.get().meta() {
+                AnyArray::F64(_) => np_float(py, *(p as *const f64)),
+                AnyArray::I64(_) => np_i64(py, *(p as *const i64)),
+                AnyArray::Bool(_) => np_bool(py, *(p as *const bool)),
+            }
+        };
+    }
+    let arr = slf.get().meta();
+    if slf.get().strided.is_some() {
+        let sels: Vec<Selector> = idx.iter().map(|&i| Selector::Int(i)).collect();
+        let (plan, _) = arr.selection_plan(&sels)?;
+        return view_from_layout(slf, layout_of(slf).select(&plan, &sels));
+    }
     match arr.get(idx)? {
         Some(Scalar::F(v)) => np_float(py, v),
         Some(Scalar::I(v)) => np_i64(py, v),
         Some(Scalar::B(v)) => np_bool(py, v),
-        None => PyArray::from_any(arr.index(idx)?).into_py(py),
+        None => PyArray::from_any(arr.index_view(idx, || base_of(slf))?).into_py(py),
     }
+}
+
+/// Basic indexing with slices: a contiguous window when possible (the fast
+/// path), a strided view otherwise. `new_axes` are result positions of `None`.
+fn select_result(slf: &Bound<'_, PyArray>, sels: &[Selector], new_axes: &[usize]) -> PyResult<Py<PyAny>> {
+    let py = slf.py();
+    let arr = slf.get().meta();
+    let (plan, out_shape) = arr.selection_plan(sels)?;
+    if slf.get().strided.is_none() {
+        if let Some(mut selected) = arr.plan_view(&plan, &out_shape, || base_of(slf))? {
+            if !new_axes.is_empty() {
+                let mut shape = out_shape;
+                for &pos in new_axes {
+                    shape.insert(pos.min(shape.len()), 1);
+                }
+                selected.set_shape(&shape)?;
+            }
+            return PyArray::from_any(selected).into_py(py);
+        }
+    }
+    let mut layout = layout_of(slf).select(&plan, sels);
+    for &pos in new_axes {
+        layout.insert_axis(pos)?;
+    }
+    view_from_layout(slf, layout)
 }
 
 /// Bitwise operators: masks and integer arrays natively, NumPy otherwise

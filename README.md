@@ -118,8 +118,14 @@ dtype inference (`np.array([1, 2])` is int64, comparisons give bool arrays,
 int and float mix to float64); every other dtype and the long tail of NumPy
 functions go through NumPy at NumPy speed plus about 1 µs and come back as
 NumPy arrays. Known limits: `isinstance(x, numpy.ndarray)` is False for a
-lightarray array and cannot be made True, and slices are copies rather than
-views. Against the official Array API test suite lightarray passes 1360 of
+lightarray array and cannot be made True. Indexing with integers and slices,
+`reshape`, `ravel` and `.T` return views that share memory with the array, as
+in NumPy (`row = a[0]; row[:] = 0` and `a[:, 1] *= 2` change `a`). The
+kernels work on contiguous buffers: a contiguous selection is a window into
+the base's buffer at no extra cost, while a strided one (`a[:, 0]`, `a[::2]`,
+the transpose of a matrix) is gathered from the base when it is used, which
+is cheap for small arrays and one extra pass over the data for large ones.
+Against the official Array API test suite lightarray passes 1360 of
 1374 tests; the remaining ones are complex-number special cases and
 `fft.fftfreq(dtype=)`, which NumPy itself does not pass.
 

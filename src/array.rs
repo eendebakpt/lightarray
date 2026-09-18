@@ -1,13 +1,88 @@
-//! The Rust-side array: an owned, C-contiguous float64 buffer plus inline
-//! dims. Python never sees this type directly; `python.rs` wraps it.
+//! The Rust-side array: a C-contiguous buffer (owned, or a view into another
+//! array's buffer) plus inline dims. Python never sees this type directly; `python.rs` wraps it.
 
 use crate::dims::{Dims, DimsError};
 use std::fmt;
 
 #[derive(Clone)]
 pub struct Array<T = f64> {
-    pub(crate) data: Vec<T>,
+    pub(crate) data: Storage<T>,
     pub(crate) dims: Dims,
+}
+
+/// The element buffer of an array: its own allocation, or a contiguous window
+/// into the buffer of another (Python-level) array, which `base` keeps alive.
+/// A base never reallocates its buffer, so the pointer stays valid. Cloning a
+/// view gives an owned copy. Stored as raw parts (a boxed slice when owned) so
+/// that taking the slice needs no branch and the array stays three cache lines.
+pub struct Storage<T> {
+    ptr: *mut T,
+    len: usize,
+    base: Option<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl<T> Drop for Storage<T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.base.is_none() {
+            // SAFETY: owned storage was created from a boxed slice of this length.
+            unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.len))) }
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Storage<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: owned allocation, or a window of `base`'s, which outlives us.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T> std::ops::DerefMut for Storage<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as above; Python-level access is serialised by the GIL.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T: Clone> Clone for Storage<T> {
+    fn clone(&self) -> Self {
+        self.to_vec().into()
+    }
+}
+
+impl<T> From<Vec<T>> for Storage<T> {
+    #[inline(always)]
+    fn from(v: Vec<T>) -> Self {
+        // Exact-capacity vectors (everything the kernels build) convert for free.
+        let len = v.len();
+        let ptr = Box::into_raw(v.into_boxed_slice()) as *mut T;
+        Storage { ptr, len, base: None }
+    }
+}
+
+impl<T> FromIterator<T> for Storage<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<T>>().into()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Storage<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T> Storage<T> {
+    /// The array whose buffer this storage points into, for views.
+    pub fn base(&self) -> Option<&pyo3::Py<pyo3::PyAny>> {
+        self.base.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,18 +177,18 @@ impl<T: Element> Array<T> {
         if dims.size() != data.len() {
             return Err(ArrayError::SizeMismatch { expected: dims.size(), got: data.len() });
         }
-        Ok(Array { data, dims })
+        Ok(Array { data: data.into(), dims })
     }
 
 
     pub fn scalar(value: T) -> Array<T> {
-        Array { data: vec![value], dims: Dims::scalar_with(std::mem::size_of::<T>()) }
+        Array { data: vec![value].into(), dims: Dims::scalar_with(std::mem::size_of::<T>()) }
     }
 
 
     pub fn filled(shape: &[usize], value: T) -> Result<Array<T>> {
         let dims = Dims::with_itemsize(shape, std::mem::size_of::<T>())?;
-        Ok(Array { data: vec![value; dims.size()], dims })
+        Ok(Array { data: vec![value; dims.size()].into(), dims })
     }
 
 
@@ -193,7 +268,7 @@ impl<T: Element> Array<T> {
     pub fn index(&self, indices: &[isize]) -> Result<Array<T>> {
         let (offset, dims) = self.locate(indices)?;
         let n = dims.size();
-        Ok(Array { data: self.data[offset..offset + n].to_vec(), dims })
+        Ok(Array { data: self.data[offset..offset + n].to_vec().into(), dims })
     }
 
 
@@ -204,15 +279,13 @@ impl<T: Element> Array<T> {
     }
 
 
-    /// General basic indexing: one selector per leading axis, remaining axes
-    /// taken whole. Integer selectors drop their axis; slices keep it. The
-    /// result is a copy (views arrive in Phase 4).
-    pub fn select(&self, sels: &[Selector]) -> Result<Array<T>> {
+    /// Per axis `(start, step, count)` of a basic index, and the result shape.
+    #[allow(clippy::type_complexity)]
+    pub fn selection_plan(&self, sels: &[Selector]) -> Result<(Vec<(usize, isize, usize)>, Vec<usize>)> {
         if sels.len() > self.ndim() {
             return Err(ArrayError::TooManyIndices { given: sels.len(), ndim: self.ndim() });
         }
         let shape = self.shape();
-        // Per axis: (start, step, count) in elements of that axis.
         let mut plan: Vec<(usize, isize, usize)> = Vec::with_capacity(self.ndim());
         let mut out_shape: Vec<usize> = Vec::with_capacity(self.ndim());
         for axis in 0..self.ndim() {
@@ -238,13 +311,150 @@ impl<T: Element> Array<T> {
                 }
             }
         }
+        Ok((plan, out_shape))
+    }
+
+
+    fn elem_strides(&self) -> Vec<usize> {
+        self.dims.strides().iter().map(|&s| s as usize / std::mem::size_of::<T>()).collect()
+    }
+
+
+    /// General basic indexing: one selector per leading axis, remaining axes
+    /// taken whole. Integer selectors drop their axis; slices keep it. The
+    /// result is a copy; `select_view` shares memory where it can.
+    pub fn select(&self, sels: &[Selector]) -> Result<Array<T>> {
+        let (plan, out_shape) = self.selection_plan(sels)?;
+        self.gather_plan(&plan, &out_shape)
+    }
+
+
+    fn gather_plan(&self, plan: &[(usize, isize, usize)], out_shape: &[usize]) -> Result<Array<T>> {
         let out_size: usize = out_shape.iter().product();
         let mut out = Vec::with_capacity(out_size);
         if out_size > 0 {
-            let elem_strides: Vec<usize> = self.dims.strides().iter().map(|&s| s as usize / std::mem::size_of::<T>()).collect();
-            gather(&self.data, &plan, &elem_strides, 0, 0, &mut out);
+            gather(&self.data, plan, &self.elem_strides(), 0, 0, &mut out);
         }
-        Array::new(out, &out_shape)
+        Array::new(out, out_shape)
+    }
+
+
+    /// Like `select`, but sharing memory: a selection that is one contiguous
+    /// block of the buffer (`a[i]`, `a[2:5]`, `a[1, 2:4]`, `a[1:3, :]`, ...)
+    /// becomes a view kept alive by `base()`. None for strided selections,
+    /// which the caller turns into a strided view.
+    pub fn select_view(&self, sels: &[Selector], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<Option<Array<T>>> {
+        let (plan, out_shape) = self.selection_plan(sels)?;
+        self.plan_view(&plan, &out_shape, base)
+    }
+
+
+    /// `select_view` for a plan made by `selection_plan`.
+    pub fn plan_view(&self, plan: &[(usize, isize, usize)], out_shape: &[usize], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<Option<Array<T>>> {
+        let shape = self.shape();
+        let strides = self.elem_strides();
+        let mut offset = 0usize;
+        let mut block_started = false;
+        for (axis, &(start, step, count)) in plan.iter().enumerate() {
+            if count == 0 {
+                // empty result: nothing to share
+                return Ok(Some(Array::new(Vec::new(), out_shape)?));
+            }
+            if block_started {
+                if !(start == 0 && step == 1 && count == shape[axis]) {
+                    return Ok(None);
+                }
+            } else {
+                offset += start * strides[axis];
+                if count > 1 {
+                    if step != 1 {
+                        return Ok(None);
+                    }
+                    block_started = true;
+                }
+            }
+        }
+        let dims = Dims::with_itemsize(out_shape, std::mem::size_of::<T>())?;
+        Ok(Some(self.view(offset, dims, base())))
+    }
+
+
+    /// A C-contiguous window at `ptr` into the buffer owned by `base`.
+    ///
+    /// # Safety
+    /// `ptr` must address `shape.product()` elements inside `base`'s buffer.
+    pub unsafe fn raw_view(ptr: *mut u8, shape: &[usize], base: pyo3::Py<pyo3::PyAny>) -> Result<Array<T>> {
+        let dims = Dims::with_itemsize(shape, std::mem::size_of::<T>())?;
+        Ok(Array { data: Storage { ptr: ptr as *mut T, len: dims.size(), base: Some(base) }, dims })
+    }
+
+
+    /// Fill this array from a strided source: element `[i, j, ...]` is read
+    /// at `ptr + i*strides[0] + j*strides[1] + ...` (byte strides).
+    ///
+    /// # Safety
+    /// Every addressed element must be valid memory holding a `T`.
+    pub unsafe fn gather_from(&mut self, ptr: *const u8, strides: &[isize]) {
+        let dims = self.dims;
+        let shape = dims.shape();
+        let data: &mut [T] = &mut self.data;
+        // SAFETY: the caller guarantees the addressed elements.
+        unsafe {
+            walk_strided(shape, strides, |k, offset| data[k] = *(ptr.offset(offset) as *const T));
+        }
+    }
+
+
+    /// The inverse of `gather_from`: write every element to the strided target.
+    ///
+    /// # Safety
+    /// As for `gather_from`, and the memory must be writable.
+    pub unsafe fn scatter_to(&self, ptr: *mut u8, strides: &[isize]) {
+        let data: &[T] = &self.data;
+        // SAFETY: the caller guarantees the addressed elements.
+        unsafe {
+            walk_strided(self.shape(), strides, |k, offset| *(ptr.offset(offset) as *mut T) = data[k]);
+        }
+    }
+
+
+    /// `a[i, j, ...]` with integers only, as a view of the sub-array.
+    pub fn index_view(&self, indices: &[isize], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<Array<T>> {
+        let (offset, dims) = self.locate(indices)?;
+        Ok(self.view(offset, dims, base()))
+    }
+
+
+    /// The whole buffer under another shape, as a view.
+    pub fn reshape_view(&self, shape: &[usize], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<Array<T>> {
+        let dims = Dims::with_itemsize(shape, std::mem::size_of::<T>())?;
+        if dims.size() != self.size() {
+            return Err(ArrayError::SizeMismatch { expected: dims.size(), got: self.size() });
+        }
+        Ok(self.view(0, dims, base()))
+    }
+
+
+    /// `dims.size()` elements starting at `offset`, sharing this buffer.
+    fn view(&self, offset: usize, dims: Dims, base: pyo3::Py<pyo3::PyAny>) -> Array<T> {
+        let len = dims.size();
+        assert!(offset + len <= self.data.len(), "view out of bounds");
+        // SAFETY: the range was just checked; `base` keeps the buffer alive.
+        let ptr = unsafe { self.data.as_ptr().add(offset) as *mut T };
+        Array { data: Storage { ptr, len, base: Some(base) }, dims }
+    }
+
+
+    /// The base array for views, None for arrays owning their buffer.
+    pub fn base(&self) -> Option<&pyo3::Py<pyo3::PyAny>> {
+        self.data.base()
+    }
+
+
+    /// Address range of the buffer, to detect overlapping operands.
+    pub fn span(&self) -> (usize, usize) {
+        let start = self.data.as_ptr() as usize;
+        (start, start + self.data.len() * std::mem::size_of::<T>())
     }
 
 
@@ -311,7 +521,7 @@ impl<T: Element> Array<T> {
                         data.push(self.data[r * cols + c]);
                     }
                 }
-                Array { data, dims: Dims::with_itemsize(&[cols, rows], std::mem::size_of::<T>()).expect("2-d") }
+                Array { data: data.into(), dims: Dims::with_itemsize(&[cols, rows], std::mem::size_of::<T>()).expect("2-d") }
             }
             _ => {
                 let shape = self.shape();
@@ -332,7 +542,7 @@ impl<T: Element> Array<T> {
                         idx[k] = 0;
                     }
                 }
-                Array { data, dims: Dims::with_itemsize(&rev_shape, std::mem::size_of::<T>()).expect("same ndim") }
+                Array { data: data.into(), dims: Dims::with_itemsize(&rev_shape, std::mem::size_of::<T>()).expect("same ndim") }
             }
         }
     }
@@ -372,7 +582,53 @@ impl<T: Element> Array<T> {
 
 
     pub fn reshape(&self, shape: &[usize]) -> Result<Array<T>> {
-        Array::new(self.data.clone(), shape)
+        Array::new(self.data.to_vec(), shape)
+    }
+}
+
+/// Visit every element of a strided layout in C order: `f(k, byte_offset)`
+/// with `k` the flat index. One and two dimensions avoid the odometer.
+#[inline]
+fn walk_strided(shape: &[usize], strides: &[isize], mut f: impl FnMut(usize, isize)) {
+    match shape.len() {
+        0 => f(0, 0),
+        1 => {
+            for i in 0..shape[0] {
+                f(i, i as isize * strides[0]);
+            }
+        }
+        2 => {
+            let mut k = 0;
+            for i in 0..shape[0] {
+                let row = i as isize * strides[0];
+                for j in 0..shape[1] {
+                    f(k, row + j as isize * strides[1]);
+                    k += 1;
+                }
+            }
+        }
+        n => {
+            let size: usize = shape.iter().product();
+            if size == 0 {
+                return;
+            }
+            let mut idx = [0usize; crate::dims::MAX_NDIM];
+            let mut offset = 0isize;
+            for k in 0..size {
+                f(k, offset);
+                let mut axis = n;
+                while axis > 0 {
+                    axis -= 1;
+                    idx[axis] += 1;
+                    offset += strides[axis];
+                    if idx[axis] < shape[axis] {
+                        break;
+                    }
+                    offset -= strides[axis] * shape[axis] as isize;
+                    idx[axis] = 0;
+                }
+            }
+        }
     }
 }
 
@@ -419,8 +675,8 @@ impl Array<f64> {
     #[inline]
     pub fn zip_map<F: Fn(f64, f64) -> f64>(&self, other: &Array, f: F) -> Result<Array> {
         if self.dims == other.dims {
-            let data = self.data.iter().zip(&other.data).map(|(&a, &b)| f(a, b)).collect();
-            return Ok(Array { data, dims: self.dims });
+            let data: Vec<f64> = self.data.iter().zip(other.data.iter()).map(|(&a, &b)| f(a, b)).collect();
+            return Ok(Array { data: data.into(), dims: self.dims });
         }
         self.zip_map_broadcast(other, f)
     }
@@ -461,7 +717,8 @@ impl Array<f64> {
     /// `f(a[i])`.
     #[inline]
     pub fn map<F: Fn(f64) -> f64>(&self, f: F) -> Array {
-        Array { data: self.data.iter().map(|&a| f(a)).collect(), dims: self.dims }
+        let data: Vec<f64> = self.data.iter().map(|&a| f(a)).collect();
+        Array { data: data.into(), dims: self.dims }
     }
 
 
@@ -626,7 +883,7 @@ impl Array<f64> {
     pub fn scan<F: Fn(f64, f64) -> f64>(&self, init: f64, f: F) -> Array {
         let mut acc = init;
         let data: Vec<f64> = self.data.iter().map(|&x| { acc = f(acc, x); acc }).collect();
-        Array { data, dims: Dims::from_shape(&[self.size()]).expect("1-d") }
+        Array { data: data.into(), dims: Dims::from_shape(&[self.size()]).expect("1-d") }
     }
 
 
@@ -835,6 +1092,77 @@ impl AnyArray {
     pub fn select(&self, sels: &[Selector]) -> Result<AnyArray> {
         Ok(map_each!(self, a => a.select(sels)?))
     }
+    /// Basic indexing that shares memory; None when the selection is strided.
+    pub fn select_view(&self, sels: &[Selector], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<Option<AnyArray>> {
+        Ok(match self {
+            AnyArray::F64(a) => a.select_view(sels, base)?.map(AnyArray::F64),
+            AnyArray::I64(a) => a.select_view(sels, base)?.map(AnyArray::I64),
+            AnyArray::Bool(a) => a.select_view(sels, base)?.map(AnyArray::Bool),
+        })
+    }
+    /// Per axis `(start, step, count)` of a basic index, and the result shape.
+    #[allow(clippy::type_complexity)]
+    pub fn selection_plan(&self, sels: &[Selector]) -> Result<(Vec<(usize, isize, usize)>, Vec<usize>)> {
+        each!(self, a => a.selection_plan(sels))
+    }
+    /// The contiguous window a plan selects; None when it is strided.
+    pub fn plan_view(&self, plan: &[(usize, isize, usize)], out_shape: &[usize], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<Option<AnyArray>> {
+        Ok(match self {
+            AnyArray::F64(a) => a.plan_view(plan, out_shape, base)?.map(AnyArray::F64),
+            AnyArray::I64(a) => a.plan_view(plan, out_shape, base)?.map(AnyArray::I64),
+            AnyArray::Bool(a) => a.plan_view(plan, out_shape, base)?.map(AnyArray::Bool),
+        })
+    }
+    /// A C-contiguous window of this dtype at `ptr`, kept alive by `base`.
+    ///
+    /// # Safety
+    /// See `Array::raw_view`.
+    pub unsafe fn raw_view_like(&self, ptr: *mut u8, shape: &[usize], base: pyo3::Py<pyo3::PyAny>) -> Result<AnyArray> {
+        // SAFETY: forwarded to the caller.
+        Ok(unsafe {
+            match self {
+                AnyArray::F64(_) => AnyArray::F64(Array::raw_view(ptr, shape, base)?),
+                AnyArray::I64(_) => AnyArray::I64(Array::raw_view(ptr, shape, base)?),
+                AnyArray::Bool(_) => AnyArray::Bool(Array::raw_view(ptr, shape, base)?),
+            }
+        })
+    }
+    /// A default-filled array of this dtype.
+    pub fn zeros_like(&self, shape: &[usize]) -> Result<AnyArray> {
+        Ok(match self {
+            AnyArray::F64(_) => AnyArray::F64(Array::filled(shape, 0.0)?),
+            AnyArray::I64(_) => AnyArray::I64(Array::filled(shape, 0)?),
+            AnyArray::Bool(_) => AnyArray::Bool(Array::filled(shape, false)?),
+        })
+    }
+    /// # Safety
+    /// See `Array::gather_from`.
+    pub unsafe fn gather_from(&mut self, ptr: *const u8, strides: &[isize]) {
+        // SAFETY: forwarded to the caller.
+        unsafe { each!(self, a => a.gather_from(ptr, strides)) }
+    }
+    /// # Safety
+    /// See `Array::scatter_to`.
+    pub unsafe fn scatter_to(&self, ptr: *mut u8, strides: &[isize]) {
+        // SAFETY: forwarded to the caller.
+        unsafe { each!(self, a => a.scatter_to(ptr, strides)) }
+    }
+    /// Integer indexing of leading axes, as a view of the sub-array.
+    pub fn index_view(&self, indices: &[isize], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.index_view(indices, base)?))
+    }
+    /// The same buffer under another shape.
+    pub fn reshape_view(&self, shape: &[usize], base: impl FnOnce() -> pyo3::Py<pyo3::PyAny>) -> Result<AnyArray> {
+        Ok(map_each!(self, a => a.reshape_view(shape, base)?))
+    }
+    /// The array this one is a view of, if any.
+    pub fn base(&self) -> Option<&pyo3::Py<pyo3::PyAny>> {
+        each!(self, a => a.base())
+    }
+    /// Address range of the buffer.
+    pub fn span(&self) -> (usize, usize) {
+        each!(self, a => a.span())
+    }
     /// In-place reshape (`a.shape = ...`): same data, new dims.
     pub fn set_shape(&mut self, shape: &[usize]) -> Result<()> {
         let size = self.size();
@@ -1024,7 +1352,7 @@ fn gather<T: Copy>(data: &[T], plan: &[(usize, isize, usize)], strides: &[usize]
 
 impl<T: Element> fmt::Debug for Array<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Array").field("shape", &self.shape()).field("data", &self.data).finish()
+        f.debug_struct("Array").field("shape", &self.shape()).field("data", &&self.data[..]).finish()
     }
 }
 

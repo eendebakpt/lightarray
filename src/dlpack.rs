@@ -103,13 +103,13 @@ unsafe extern "C" fn capsule_destructor(capsule: *mut ffi::PyObject) {
 /// Build the capsule for `array`.
 pub fn export(array: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
     let py = array.py();
-    let inner = array.get().arr();
+    let inner = array.get().meta();
     let ndim = inner.ndim();
     let mut shape = [0i64; crate::dims::MAX_NDIM];
-    let mut strides = [0i64; crate::dims::MAX_NDIM];
+    // DLPack strides are in elements; strided views export the base's memory
+    let (data, strides) = array.get().element_layout();
     for (k, &d) in inner.shape().iter().enumerate() {
         shape[k] = d as i64;
-        strides[k] = inner.dims().elem_stride(k) as i64; // DLPack strides are in elements
     }
     let mut export = Box::new(Export {
         managed: DLManagedTensorVersioned {
@@ -118,7 +118,7 @@ pub fn export(array: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
             deleter: Some(deleter),
             flags: 0,
             dl_tensor: DLTensor {
-                data: inner.data_ptr() as *mut c_void,
+                data: data as *mut c_void,
                 device: DLDevice { device_type: K_DL_CPU, device_id: 0 },
                 ndim: ndim as i32,
                 dtype: dl_dtype(inner),
@@ -188,18 +188,17 @@ unsafe extern "C" fn legacy_capsule_destructor(capsule: *mut ffi::PyObject) {
 
 pub fn export_legacy(array: &Bound<'_, PyArray>) -> PyResult<Py<PyAny>> {
     let py = array.py();
-    let inner = array.get().arr();
+    let inner = array.get().meta();
     let ndim = inner.ndim();
     let mut shape = [0i64; crate::dims::MAX_NDIM];
-    let mut strides = [0i64; crate::dims::MAX_NDIM];
+    let (data, strides) = array.get().element_layout();
     for (k, &d) in inner.shape().iter().enumerate() {
         shape[k] = d as i64;
-        strides[k] = inner.dims().elem_stride(k) as i64;
     }
     let mut export = Box::new(LegacyExport {
         managed: DLManagedTensor {
             dl_tensor: DLTensor {
-                data: inner.data_ptr() as *mut c_void,
+                data: data as *mut c_void,
                 device: DLDevice { device_type: K_DL_CPU, device_id: 0 },
                 ndim: ndim as i32,
                 dtype: dl_dtype(inner),

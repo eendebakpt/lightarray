@@ -124,6 +124,20 @@ def call(name, *args, **kwargs):
     return invoke(getattr(np, name), args, kwargs)
 
 
+def argsort_descending(a, *args, **kwargs):
+    """Array API `argsort(descending=True)`, which NumPy lacks. Sorting the
+    reversed array and mapping the indices back keeps ties in their original
+    order when `stable` is set."""
+    global calls
+    calls += 1
+    x = np.asarray(to_numpy(a))
+    axis = args[0] if args else kwargs.pop("axis", -1)
+    if axis is None:
+        x, axis = x.ravel(), -1
+    order = np.flip(np.argsort(np.flip(x, axis=axis), axis, *args[1:], **kwargs), axis=axis)
+    return from_numpy(x.shape[axis] - 1 - order)
+
+
 def call_method(arr, name, *args, **kwargs):
     """Call ndarray method `name` on the NumPy view of `arr`."""
     if name in ("std", "var") and "correction" in kwargs:
