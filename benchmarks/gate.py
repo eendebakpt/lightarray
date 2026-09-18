@@ -4,6 +4,7 @@ Runs the key micro-benchmarks and fails (exit 1) when any exceeds its
 threshold. Thresholds are 1.5x the measured numbers so that noisy
 machines do not trip it; a real regression (like the `__getattr__` slot that
 once cost 65 ns per call) does. Run it after every change to src/.
+For a check that notices a few percent on your own machine, see perf_check.py.
 
     python benchmarks/gate.py [--quiet]
 """

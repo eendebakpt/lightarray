@@ -85,3 +85,6 @@ PROJECT_PLAN.md
 OVERHEAD_ANALYSIS.md
 IMPLEMENTATION_PROGRESS.md
 RELEASING.md
+
+# machine-specific baseline of benchmarks/perf_check.py
+benchmarks/.perf_baseline*.json

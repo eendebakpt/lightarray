@@ -156,9 +156,17 @@ maturin develop --release
 pytest                          # parity tests against NumPy
 cargo test --release --lib      # kernel tests
 benchmarks/carray_reference/build.sh && python benchmarks/bench_overhead.py
-python benchmarks/gate.py       # performance regression gate
+python benchmarks/gate.py       # coarse performance gate with absolute limits (CI)
+python benchmarks/perf_check.py --save   # record this machine's timings of 70 key operations ...
+python benchmarks/perf_check.py          # ... and fail when a later build is more than 4% slower
 python examples/lmfit_model_fit.py   # lmfit example running on lightarray
 python examples/lmfit_internals.py   # lmfit's own internals rebound to lightarray
 ```
+
+New features must not cost the hot paths anything: run `perf_check.py --save`
+before starting on a change and `perf_check.py` after rebuilding. It measures
+in several fresh processes pinned to one core and compares with the saved
+baseline, so it notices a few nanoseconds where `gate.py` only catches gross
+regressions.
 
 Requires Python 3.10+, NumPy 2.1+, and a stable Rust toolchain.
