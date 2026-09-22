@@ -292,29 +292,135 @@ static NP_NDARRAY: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static NP_INTP: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static NP_BOOL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
-/// A `numpy.intp` scalar (what `argmax` returns in NumPy).
-pub fn np_int(py: Python<'_>, v: usize) -> PyResult<Py<PyAny>> {
-    let ty = NP_INTP.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("intp")?.unbind()) })?;
-    Ok(ty.bind(py).call1((v,))?.unbind())
+/// `PyArray_Scalar(data, descr, base)` from NumPy's C API: builds a NumPy
+/// scalar straight from the bytes of the value. The Python constructors do
+/// the same through argument parsing and a temporary 0-d array, which costs
+/// 80 ns for `np.float64` and 250 ns for `np.int64`; this takes about 25.
+type ScalarFn = unsafe extern "C" fn(*const c_void, *mut ffi::PyObject, *mut ffi::PyObject) -> *mut ffi::PyObject;
+
+struct NumpyScalars {
+    scalar: ScalarFn,
+    /// `np.dtype` objects (a `PyArray_Descr` each) for the three native types.
+    f64_descr: Py<PyAny>,
+    i64_descr: Py<PyAny>,
+    /// The `np.True_` / `np.False_` singletons.
+    true_: Py<PyAny>,
+    false_: Py<PyAny>,
 }
 
-/// A `numpy.int64` scalar (integer reductions and integer indexing).
-pub fn np_i64(py: Python<'_>, v: i64) -> PyResult<Py<PyAny>> {
-    let ty = NP_INTP.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("intp")?.unbind()) })?;
-    Ok(ty.bind(py).call1((v,))?.unbind())
+// SAFETY: the function pointer is immutable and the Py<> handles are only
+// used with the GIL (thread attached).
+unsafe impl Send for NumpyScalars {}
+unsafe impl Sync for NumpyScalars {}
+
+static NP_SCALARS: PyOnceLock<Option<NumpyScalars>> = PyOnceLock::new();
+
+/// Index of `PyArray_Scalar` in NumPy's C API table (`__multiarray_api.h`);
+/// the table is append-only, so the index is stable across NumPy versions.
+const PYARRAY_SCALAR_INDEX: usize = 60;
+
+/// The fast scalar constructors, or None when the C API is not available or
+/// does not behave as expected (then the Python constructors are used).
+#[inline]
+fn numpy_scalars(py: Python<'_>) -> Option<&'static NumpyScalars> {
+    NP_SCALARS.get_or_init(py, || load_numpy_scalars(py)).as_ref()
 }
 
-/// A `numpy.bool_` scalar (what `any`/`all`/predicates return in NumPy).
-pub fn np_bool(py: Python<'_>, v: bool) -> PyResult<Py<PyAny>> {
-    let ty = NP_BOOL.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("bool_")?.unbind()) })?;
-    Ok(ty.bind(py).call1((v,))?.unbind())
+/// Runs once; kept out of line so that the call sites (every reduction and
+/// scalar index) stay small.
+#[cold]
+#[inline(never)]
+fn load_numpy_scalars(py: Python<'_>) -> Option<NumpyScalars> {
+    {
+        {
+            let load = || -> PyResult<NumpyScalars> {
+                let np = py.import("numpy")?;
+                let capsule = py.import("numpy._core._multiarray_umath")?.getattr("_ARRAY_API")?;
+                // SAFETY: `_ARRAY_API` is the capsule NumPy publishes for its C API table,
+                // an array of function pointers of which entry 60 is PyArray_Scalar.
+                let scalar: ScalarFn = unsafe {
+                    let table = ffi::PyCapsule_GetPointer(capsule.as_ptr(), ptr::null()) as *const *const c_void;
+                    if table.is_null() {
+                        return Err(PyValueError::new_err("no NumPy C API table"));
+                    }
+                    std::mem::transmute::<*const c_void, ScalarFn>(*table.add(PYARRAY_SCALAR_INDEX))
+                };
+                let dtype = np.getattr("dtype")?;
+                let s = NumpyScalars {
+                    scalar,
+                    f64_descr: dtype.call1(("float64",))?.unbind(),
+                    i64_descr: dtype.call1(("int64",))?.unbind(),
+                    true_: np.getattr("True_")?.unbind(),
+                    false_: np.getattr("False_")?.unbind(),
+                };
+                // Verify before trusting it: the right types and values must come back.
+                let f = s.make_f64(py, -2.5)?;
+                let i = s.make_i64(py, -7)?;
+                let ok = f.bind(py).is_exact_instance(np.getattr("float64")?.cast::<pyo3::types::PyType>()?)
+                    && f.bind(py).extract::<f64>()? == -2.5
+                    && i.bind(py).is_exact_instance(np.getattr("int64")?.cast::<pyo3::types::PyType>()?)
+                    && i.bind(py).extract::<i64>()? == -7
+                    && s.make_i64(py, i64::MAX)?.bind(py).extract::<i64>()? == i64::MAX;
+                if !ok {
+                    return Err(PyValueError::new_err("PyArray_Scalar does not behave as expected"));
+                }
+                Ok(s)
+            };
+            load().ok()
+        }
+    }
+}
+
+impl NumpyScalars {
+    #[inline]
+    fn make(&self, py: Python<'_>, data: *const c_void, descr: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+        // SAFETY: `data` points at a value of the type `descr` describes; the
+        // descr is a live `np.dtype` object; the result is a new reference.
+        unsafe { Bound::from_owned_ptr_or_err(py, (self.scalar)(data, descr.as_ptr(), ptr::null_mut())).map(Bound::unbind) }
+    }
+    #[inline]
+    fn make_f64(&self, py: Python<'_>, v: f64) -> PyResult<Py<PyAny>> {
+        self.make(py, &v as *const f64 as *const c_void, &self.f64_descr)
+    }
+    #[inline]
+    fn make_i64(&self, py: Python<'_>, v: i64) -> PyResult<Py<PyAny>> {
+        self.make(py, &v as *const i64 as *const c_void, &self.i64_descr)
+    }
 }
 
 /// A `numpy.float64` scalar, what NumPy returns from reductions and scalar
 /// indexing (it carries `.dtype`, `.astype`, `.round`, ... unlike a Python
-/// float). Costs about 80 ns; parity is worth it.
+/// float).
 pub fn np_float(py: Python<'_>, v: f64) -> PyResult<Py<PyAny>> {
+    if let Some(s) = numpy_scalars(py) {
+        return s.make_f64(py, v);
+    }
     let ty = NP_FLOAT64.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("float64")?.unbind()) })?;
+    Ok(ty.bind(py).call1((v,))?.unbind())
+}
+
+/// A `numpy.intp` scalar (what `argmax` returns in NumPy; int64 on every
+/// platform lightarray builds for).
+pub fn np_int(py: Python<'_>, v: usize) -> PyResult<Py<PyAny>> {
+    np_i64(py, v as i64)
+}
+
+/// A `numpy.int64` scalar (integer reductions and integer indexing).
+pub fn np_i64(py: Python<'_>, v: i64) -> PyResult<Py<PyAny>> {
+    if let Some(s) = numpy_scalars(py) {
+        return s.make_i64(py, v);
+    }
+    let ty = NP_INTP.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("int64")?.unbind()) })?;
+    Ok(ty.bind(py).call1((v,))?.unbind())
+}
+
+/// A `numpy.bool_` scalar (what `any`/`all`/predicates return in NumPy):
+/// one of the two singletons.
+pub fn np_bool(py: Python<'_>, v: bool) -> PyResult<Py<PyAny>> {
+    if let Some(s) = numpy_scalars(py) {
+        return Ok(if v { s.true_.clone_ref(py) } else { s.false_.clone_ref(py) });
+    }
+    let ty = NP_BOOL.get_or_try_init(py, || -> PyResult<Py<PyAny>> { Ok(py.import("numpy")?.getattr("bool_")?.unbind()) })?;
     Ok(ty.bind(py).call1((v,))?.unbind())
 }
 
@@ -2086,6 +2192,9 @@ fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
 }
 
 /// `a[i, j]`: a NumPy scalar for a full index, a view of the sub-array otherwise.
+/// Out of line: inlined into `__getitem__` it grows that function's frame,
+/// which cost the slice paths 10 ns.
+#[inline(never)]
 fn index_result(slf: &Bound<'_, PyArray>, idx: &[isize]) -> PyResult<Py<PyAny>> {
     let py = slf.py();
     if let Some(p) = slf.get().strided_element(idx)? {

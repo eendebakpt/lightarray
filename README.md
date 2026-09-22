@@ -1,8 +1,8 @@
 # lightarray
 
 A small-array library for Python with the NumPy interface. Arrays of up to a
-few thousand elements run several times faster than NumPy because the
-per-operation overhead is 30 to 70 ns instead of NumPy's 350 to 500 ns.
+few thousand elements run faster than NumPy because the
+per-operation overhead smaller.
 Everything lightarray does not implement itself is delegated to NumPy.
 
 ```python
@@ -85,35 +85,35 @@ per-evaluation path delegates nothing ([examples/lmfit_internals.py](examples/lm
 ## Speed
 
 Total time per operation in nanoseconds, best of 7 runs, benchmarked against
-NumPy 2.5.3 on Python 3.14.2, one core of an i7-13650HX.
+NumPy 2.5.3 on Python 3.14.2.
 
 | Operation | lightarray | NumPy |
 |---|---|---|
-| `a + b` | 82 | 385 |
-| `a * 2.0` | 80 | 593 |
-| `np.sin(a)` | 103 | 371 |
-| `a.sum()` | 125 | 462 |
-| `a.std()` | 126 | 6558 |
-| `np.sum(a)` | 118 | 1506 |
-| `a > 0.5` | 92 | 578 |
-| `a[a > 0.5]` | 204 | 880 |
-| `(a > 0.2) & (a < 0.8)` | 256 | 1559 |
-| `np.where(a > 0.5, a, 0.0)` | 281 | 1418 |
-| `i * 2` | 98 | 667 |
-| `a[idx]` | 116 | 145 |
-| `m[1]` | 76 | 78 |
-| `m[:, 1]` | 182 | 86 |
-| `np.array(values)` | 134 | 479 |
-| `np.arange(10)` | 115 | 404 |
-| `np.zeros(10)` | 119 | 180 |
-| `a[3] = 2.0` | 42 | 39 |
-| `a += 1.0` | 26 | 552 |
+| `a + b` | 80 | 345 |
+| `a * 2.0` | 80 | 533 |
+| `np.sin(a)` | 103 | 378 |
+| `a.sum()` | 65 | 499 |
+| `a.std()` | 66 | 6529 |
+| `np.sum(a)` | 62 | 1550 |
+| `a > 0.5` | 90 | 535 |
+| `a[a > 0.5]` | 206 | 844 |
+| `(a > 0.2) & (a < 0.8)` | 251 | 1427 |
+| `np.where(a > 0.5, a, 0.0)` | 275 | 1411 |
+| `i * 2` | 99 | 629 |
+| `a[idx]` | 116 | 144 |
+| `m[1]` | 74 | 78 |
+| `m[:, 1]` | 195 | 86 |
+| `np.array(values)` | 136 | 476 |
+| `np.arange(10)` | 113 | 401 |
+| `np.zeros(10)` | 114 | 176 |
+| `a[3] = 2.0` | 40 | 39 |
+| `a += 1.0` | 26 | 495 |
 
 `a` and `b` are float64 arrays of 10 elements, `m` is a 10 x 10 float64
 array, `i` is `np.arange(10)`, `idx` an int64 array of 3 indices and `values`
 a list of 10 floats (`python benchmarks/readme_table.py` regenerates the table).
-Reductions include building the `np.float64` result, which is most
-of `a.sum()`'s time. Creating a strided view (`m[:, 1]`) is the one
+Reductions return NumPy's scalar types (`np.float64`, `np.int64`), built
+through NumPy's C API in about 25 ns. Creating a strided view (`m[:, 1]`) is the one
 operation slower than NumPy: it allocates the contiguous cache the kernels
 work on. Above roughly 10000 elements the two libraries converge; lightarray
 is not a large-array library.

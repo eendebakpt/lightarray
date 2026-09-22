@@ -1463,3 +1463,24 @@ def test_isinstance_of_numpy_ndarray():
     assert type(np.asarray(a)) is np.ndarray  # NumPy's own conversion still gives a real ndarray
     with pytest.raises((AttributeError, TypeError)):
         a.__class__ = list
+
+
+def test_numpy_scalar_results_are_built_from_bytes():
+    """Reductions and scalar indexing return NumPy's own scalar types, built
+    through NumPy's C API (PyArray_Scalar) rather than the Python constructors:
+    same types and values, at a quarter of the cost."""
+    a = la.array([0.5, -2.0, 1e300, 3.25])
+    i = la.array([2**62, 2**62, -5])
+    assert type(a.sum()) is np.float64 and a.sum() == 1e300 and type(a[3]) is np.float64 and a[3] == 3.25
+    assert type(a.argmax()) is np.intp and a.argmax() == 2 and type(a.argmin()) is np.intp
+    assert type(i[2]) is np.int64 and i[2] == -5 and type(i.max()) is np.int64 and i.max() == 2**62
+    assert i.sum() == np.array([2**62, 2**62, -5]).sum()  # wraps, as NumPy's int64 does
+    assert la.array([-(2**63)]).sum() == -(2**63) and la.array([2**63 - 1]).max() == 2**63 - 1
+    assert type(a.min()) is np.float64 and np.isnan(la.array([np.nan, 1.0]).max())
+    assert a.any() is np.True_ and (a < -5).any() is np.False_ and la.isnan(1.5) is np.False_
+    assert type(la.count_nonzero(a)) is np.intp
+    assert la.array([-0.0]).sum().dtype == np.float64 and np.signbit(la.array([-0.0])[0])
+    r = a.sum()
+    assert r.round(0) == 1e300 and r.astype(np.float32).dtype == np.float32 and float(r) == 1e300
+    assert isinstance(a[0], float) and not isinstance(i[0], int)  # np.float64 is a float, np.int64 is not an int
+    assert i[0].item() == 2**62 and type(i[0].item()) is int
