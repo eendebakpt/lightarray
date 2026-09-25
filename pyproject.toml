@@ -9,7 +9,7 @@ readme = "README.md"
 license = "MIT"
 authors = [{ name = "Pieter Eendebak" }]
 requires-python = ">=3.13"
-dependencies = ["numpy>=2.1"]
+dependencies = ["numpy>=2.3"]
 keywords = ["numpy", "array", "rust", "performance", "array-api"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -63,7 +63,7 @@ ignore = ["E501", "E731", "B008"]
 build = "cp313-* cp314-*"
 skip = ["*-musllinux_i686", "*-manylinux_i686", "*-win32", "pp*"]
 build-verbosity = 1
-test-requires = ["pytest", "numpy>=2.1"]
+test-requires = ["pytest", "numpy>=2.3"]
 test-command = "pytest {project}/tests/test_numpy_parity.py {project}/tests/test_dropin.py -q"
 # macOS: arm64 natively and x86_64 cross-compiled, both on the arm64 runner
 [tool.cibuildwheel.linux]

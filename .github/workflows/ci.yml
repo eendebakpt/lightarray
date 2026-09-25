@@ -60,7 +60,7 @@ jobs:
       - name: Build and install
         run: |
           pip install --upgrade pip
-          pip install "numpy>=2.1" pytest scipy lmfit
+          pip install "numpy>=2.3" pytest scipy lmfit
           pip install -v .
       - name: Python tests
         run: pytest -q
