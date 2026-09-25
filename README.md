@@ -120,7 +120,7 @@ is not a large-array library.
 
 ## Status
 
-Version 0.3.0. float64, int64 and bool arrays are native, with NumPy's
+Version 0.3.1. float64, int64 and bool arrays are native, with NumPy's
 dtype inference (`np.array([1, 2])` is int64, comparisons give bool arrays,
 int and float mix to float64); every other dtype and the long tail of NumPy
 functions go through NumPy at NumPy speed plus about 1 µs and come back as
@@ -159,7 +159,7 @@ add the Array API keywords NumPy lacks (`sort(descending=)`,
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install maturin "numpy>=2.1" pytest matplotlib lmfit
+pip install maturin "numpy>=2.3" pytest matplotlib lmfit
 maturin develop --release
 pytest                          # parity tests against NumPy
 cargo test --release --lib      # kernel tests
@@ -181,4 +181,4 @@ in several fresh processes pinned to one core and compares with the saved
 baseline, so it notices a few nanoseconds where `gate.py` only catches gross
 regressions.
 
-Requires Python 3.10+, NumPy 2.1+, and a stable Rust toolchain.
+Requires Python 3.13+, NumPy 2.3+, and a stable Rust toolchain.
