@@ -19,7 +19,7 @@ from lightarray import _core, _fallback
 from lightarray._core import *  # noqa: F401,F403  (native functions and ndarray)
 from lightarray._core import _noop, ndarray  # _noop: benchmark hook
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # Note: this module deliberately shadows builtins (`sum`, `max`, `min`, `abs`,
 # `round`, `any`, `all`, and `bool` copied from NumPy 2) with NumPy-compatible
