@@ -1,5 +1,9 @@
 /target
 
+# CI Rust build cache (cibuildwheel CARGO_TARGET_DIR / CARGO_HOME)
+/target-cibw
+/.cargo-home
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 .pytest_cache/
