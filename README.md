@@ -1,5 +1,7 @@
 # lightarray
 
+[![PyPI](https://img.shields.io/pypi/v/lightarray.svg)](https://pypi.org/project/lightarray/)
+
 A small-array library for Python with the NumPy interface. Arrays of up to a
 few thousand elements run faster than NumPy because the
 per-operation overhead smaller.
