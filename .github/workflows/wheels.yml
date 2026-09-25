@@ -24,27 +24,44 @@ jobs:
           path: dist/*.tar.gz
 
   wheels:
-    name: Wheels on ${{ matrix.os }}
+    name: Wheels ${{ matrix.os }} ${{ matrix.cibw_archs }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        # One arch per job so the two macOS archs build in parallel instead of
+        # serially on a single arm64 runner (previously the slowest job).
+        include:
+          - { os: ubuntu-latest, cibw_archs: x86_64 }
+          - { os: ubuntu-24.04-arm, cibw_archs: aarch64 }
+          - { os: macos-14, cibw_archs: arm64 }
+          - { os: macos-14, cibw_archs: x86_64 }
+          - { os: windows-latest, cibw_archs: AMD64 }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         if: runner.os != 'Linux'   # Linux builds run in manylinux containers; rustup is installed there by before-all
         with:
           # macOS x86_64 wheels are cross-compiled on the arm64 runner (no Intel runners left)
-          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.cibw_archs == 'x86_64' && runner.os == 'macOS' && 'x86_64-apple-darwin' || '' }}
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          # cibuildwheel is pointed at these dirs via CARGO_* (see pyproject.toml),
+          # so compiled dependencies (pyo3 & co.) survive between runs.
+          path: |
+            target-cibw
+            .cargo-home/registry
+            .cargo-home/git
+          key: cargo-${{ matrix.os }}-${{ matrix.cibw_archs }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.os }}-${{ matrix.cibw_archs }}-
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.2.1
         env:
-          CIBW_ARCHS_LINUX: ${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}
-          CIBW_ARCHS_MACOS: "arm64 x86_64"
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-${{ matrix.cibw_archs }}
           path: wheelhouse/*.whl
 
   publish:
