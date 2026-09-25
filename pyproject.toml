@@ -8,7 +8,7 @@ description = "Fast small-array library with the NumPy interface: float64 arrays
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Pieter Eendebak" }]
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = ["numpy>=2.1"]
 keywords = ["numpy", "array", "rust", "performance", "array-api"]
 classifiers = [
@@ -17,6 +17,8 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering",
 ]
@@ -43,7 +45,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 140
-target-version = "py310"
+target-version = "py313"
 extend-exclude = ["benchmarks/carray_reference"]
 
 [tool.ruff.lint]
@@ -58,7 +60,7 @@ ignore = ["E501", "E731", "B008"]
 
 # ---- wheels: cibuildwheel drives maturin through the PEP 517 backend ----------
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+build = "cp313-* cp314-*"
 skip = ["*-musllinux_i686", "*-manylinux_i686", "*-win32", "pp*"]
 build-verbosity = 1
 test-requires = ["pytest", "numpy>=2.1"]
